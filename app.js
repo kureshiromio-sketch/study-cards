@@ -531,8 +531,7 @@ function bindVocabularySelection() {
   button.type = "button";
   button.className = "small secondary";
   button.textContent = "＋ 加入单词本";
-  button.hidden = true;
-  button.style.cssText = "position:fixed;right:16px;bottom:calc(112px + env(safe-area-inset-bottom));z-index:20";
+  button.style.cssText = "display:none;position:fixed;right:16px;bottom:calc(112px + env(safe-area-inset-bottom));z-index:20";
   document.body.append(button);
 
   let term = "";
@@ -541,16 +540,16 @@ function bindVocabularySelection() {
     const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
     term = range && !range.collapsed && view().contains(range.commonAncestorContainer)
       ? vocabularyTerm(selection.toString()) : "";
-    button.hidden = !term;
+    button.style.display = term ? "inline-flex" : "none";
   });
   button.addEventListener("pointerdown", e => e.preventDefault());
   button.addEventListener("click", () => {
     if (!term) return;
     addVocabulary(term);
     window.getSelection()?.removeAllRanges();
-    button.hidden = true;
+    button.style.display = "none";
   });
-  window.addEventListener("hashchange", () => { term = ""; button.hidden = true; });
+  window.addEventListener("hashchange", () => { term = ""; button.style.display = "none"; });
 }
 
 function homeView() {
