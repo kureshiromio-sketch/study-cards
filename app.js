@@ -212,9 +212,7 @@ const DEFAULT_PROMPTS = {
 };
 // 自定义提示词存在云端（kind 'conf'），留空就用默认
 function prompts() { const c = get("conf_prompts")?.data || {}; const o = {}; for (const k in DEFAULT_PROMPTS) o[k] = (c[k] || "").trim() || DEFAULT_PROMPTS[k]; return o; }
-async function explain(card, userPick, onText) {
-  const prov = PROVIDERS[settings.provider] ? settings.provider : "claude";
-  if (!aiKey()) throw new Error(`还没有填写 ${PROVIDERS[prov].name} 的 API Key（设置 → AI 解析）`);
+function buildPrompt(card, userPick) {
   const deck = get(card.data.deckId);
   const d = card.data;
   let content;
@@ -229,10 +227,21 @@ async function explain(card, userPick, onText) {
       `\n\n${prompts().flash}`;
   }
   if (deck?.data.prompt?.trim()) content += `\n\n这个 session 的额外要求：${deck.data.prompt.trim()}`;
-  const system = prompts().system;
-  return prov === "claude" ? explainClaude(system, content, onText) : explainOpenAICompat(prov, system, content, onText);
+  return content;
 }
-async function explainClaude(system, content, onText) {
+// messages: [{role:'user'|'assistant', content}]
+function callAI(messages, onText) {
+  const prov = PROVIDERS[settings.provider] ? settings.provider : "claude";
+  if (!aiKey()) return Promise.reject(new Error(`还没有填写 ${PROVIDERS[prov].name} 的 API Key（设置 → AI 解析）`));
+  const system = prompts().system;
+  return prov === "claude" ? explainClaude(system, messages, onText) : explainOpenAICompat(prov, system, messages, onText);
+}
+async function explain(card, userPick, onText) {
+  const q = buildPrompt(card, userPick);
+  const res = await callAI([{ role: "user", content: q }], onText);
+  return { ...res, q, chat: [] };
+}
+async function explainClaude(system, messages, onText) {
   if (!AnthropicCtor) AnthropicCtor = (await import(ANTHROPIC_ESM)).default;
   const client = new AnthropicCtor({ apiKey: aiKey(), dangerouslyAllowBrowser: true });
   const model = aiModel() || "claude-opus-5-5";
@@ -244,7 +253,7 @@ async function explainClaude(system, content, onText) {
     ...fb,
     output_config: { effort: settings.effort || "low" },
     system,
-    messages: [{ role: "user", content }],
+    messages,
   });
   stream.on("text", t => onText(t));
   const msg = await stream.finalMessage();
@@ -253,7 +262,7 @@ async function explainClaude(system, content, onText) {
   return { text, model: msg.model, at: Date.now() };
 }
 // DeepSeek / 通义千问 / 其他：OpenAI 兼容的 /chat/completions 接口（流式）
-async function explainOpenAICompat(prov, system, content, onText) {
+async function explainOpenAICompat(prov, system, messages, onText) {
   const base = (prov === "custom" ? settings.customBase : PROVIDERS[prov].base || "").replace(/\/+$/, "");
   if (!base) throw new Error("请在设置里填写接口地址（Base URL）");
   const model = aiModel(); if (!model) throw new Error("请在设置里填写模型名称");
@@ -262,7 +271,7 @@ async function explainOpenAICompat(prov, system, content, onText) {
     res = await fetch(base + "/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + aiKey() },
-      body: JSON.stringify({ model, stream: true, max_tokens: 4000, messages: [{ role: "system", content: system }, { role: "user", content }] }),
+      body: JSON.stringify({ model, stream: true, max_tokens: 4000, messages: [{ role: "system", content: system }, ...messages] }),
     });
   } catch (e) { throw new Error("连不上接口（网络问题，或这个服务不允许网页直接调用）"); }
   if (!res.ok) {
@@ -659,7 +668,7 @@ function bindNav() {
 (function swipe() {
   let x0 = null, y0 = 0, t0 = 0;
   document.addEventListener("touchstart", e => {
-    if (!document.body.classList.contains("studying") || e.touches.length !== 1) { x0 = null; return; }
+    if (!document.body.classList.contains("studying") || e.touches.length !== 1 || e.target.closest("input,textarea")) { x0 = null; return; }
     x0 = e.touches[0].clientX; y0 = e.touches[0].clientY; t0 = Date.now();
   }, { passive: true });
   document.addEventListener("touchend", e => {
@@ -669,30 +678,63 @@ function bindNav() {
     if (dx < 0) { if (S.idx < S.queue.length) go(1); } else go(-1);
   }, { passive: true });
 })();
+function aiErrMsg(e) {
+  let msg = e?.message || String(e);
+  if (e?.status === 401) msg = "API Key 不正确，请到设置里检查";
+  else if (e?.status === 429) msg = "请求太频繁或额度不足，稍后再试";
+  else if (e?.status === 402 || /credit|billing|balance|余额|arrearage/i.test(msg)) msg = "AI 账户余额不足，请先充值";
+  return msg;
+}
 async function runAI(card, pick) {
   const box = $("#ai"); const btn = $("#ai-btn");
   const cached = get(card.id)?.data.ai;
-  if (cached?.text) {
-    box.innerHTML = md(cached.text) + `<div class="muted" style="margin-top:6px"><a href="#" id="regen">重新生成</a></div>`;
-    btn.style.display = "none";
-    $("#regen").onclick = e => { e.preventDefault(); const c = get(card.id); const nd = { ...c.data }; delete nd.ai; put("card", card.id, nd); runAI(card, pick); };
-    return;
-  }
+  if (cached?.text) { btn.style.display = "none"; return renderChat(card, pick); }
   btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> AI 正在解析…';
   let acc = ""; box.innerHTML = "";
   try {
     const res = await explain(card, pick, t => { acc += t; box.innerHTML = md(acc); });
     const c = get(card.id); if (c) put("card", card.id, { ...c.data, ai: res });
-    box.innerHTML = md(res.text); btn.style.display = "none";
+    btn.style.display = "none"; renderChat(card, pick);
   } catch (e) {
     console.error(e);
-    let msg = e?.message || String(e);
-    if (e?.status === 401) msg = "API Key 不正确，请到设置里检查";
-    else if (e?.status === 429) msg = "请求太频繁或额度不足，稍后再试";
-    else if (e?.status === 402 || /credit|billing|balance|余额|arrearage/i.test(msg)) msg = "AI 账户余额不足，请先充值";
-    box.innerHTML = `<div class="note" style="color:var(--bad)">解析失败：${esc(msg)}</div>`;
+    box.innerHTML = `<div class="note" style="color:var(--bad)">解析失败：${esc(aiErrMsg(e))}</div>`;
     btn.disabled = false; btn.textContent = "重试解析";
   }
+}
+// 解析 + 追问对话
+function renderChat(card, pick) {
+  const box = $("#ai"); if (!box) return;
+  const ai = get(card.id)?.data.ai; if (!ai) return;
+  const chat = ai.chat || [];
+  box.innerHTML = md(ai.text) +
+    chat.map(m => m.role === "user" ? `<div class="bubble me">${esc(m.content)}</div>` : `<div class="bubble">${md(m.content)}</div>`).join("") +
+    `<div id="chat-live"></div>
+     <div class="ask-row"><input id="ask" placeholder="继续追问，比如：再给两个例句" enterkeyhint="send"><button id="ask-go" class="small">发送</button></div>
+     <div class="muted" style="margin-top:6px;display:flex;gap:14px"><a href="#" id="regen">重新生成解析</a>${chat.length ? `<a href="#" id="clear-chat">清空追问</a>` : ""}</div>`;
+  $("#regen").onclick = e => { e.preventDefault(); if (chat.length && !confirm("重新生成会清空追问记录，确定吗？")) return; const c = get(card.id); const nd = { ...c.data }; delete nd.ai; put("card", card.id, nd); runAI(card, pick); };
+  $("#clear-chat")?.addEventListener("click", e => { e.preventDefault(); const c = get(card.id); put("card", card.id, { ...c.data, ai: { ...c.data.ai, chat: [] } }); renderChat(card, pick); });
+  const send = async () => {
+    const input = $("#ask"); const question = input.value.trim(); if (!question) return;
+    const c = get(card.id); const a = c.data.ai;
+    const history = [{ role: "user", content: a.q || buildPrompt(c, pick) }, { role: "assistant", content: a.text }, ...(a.chat || []), { role: "user", content: question }];
+    input.value = ""; input.disabled = true; $("#ask-go").disabled = true;
+    const live = $("#chat-live");
+    live.innerHTML = `<div class="bubble me">${esc(question)}</div><div class="bubble" id="live-ans"><span class="spinner"></span></div>`;
+    let acc = "";
+    try {
+      const res = await callAI(history, t => { acc += t; $("#live-ans").innerHTML = md(acc); });
+      const c2 = get(card.id);
+      put("card", card.id, { ...c2.data, ai: { ...c2.data.ai, chat: [...(c2.data.ai.chat || []), { role: "user", content: question }, { role: "assistant", content: res.text }] } });
+      renderChat(card, pick);
+      setTimeout(() => $("#ask")?.scrollIntoView({ behavior: "smooth", block: "center" }), 50);
+    } catch (e) {
+      console.error(e);
+      $("#live-ans").innerHTML = `<span style="color:var(--bad)">失败：${esc(aiErrMsg(e))}</span>`;
+      input.disabled = false; input.value = question; $("#ask-go").disabled = false;
+    }
+  };
+  $("#ask-go").onclick = send;
+  $("#ask").addEventListener("keydown", e => { if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); send(); } });
 }
 function studyDone() {
   const vals = Object.values(S.ans); const right = vals.filter(x => x.ok).length, wrong = vals.length - right;
