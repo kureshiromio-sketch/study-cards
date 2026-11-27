@@ -205,7 +205,13 @@ function buildQueue(deckId, mode) {
 
 // ---------- AI explanation ----------
 let AnthropicCtor = null;
-const SYSTEM_PROMPT = "你是一位耐心的语言与考试辅导老师。学生是中文母语者，正在准备 JLPT N1、入学考试，并在背英语和韩语单词。请用简体中文讲解，日语/英语/韩语原文保留原样。讲解要准确、简洁、有条理，使用小标题和要点列表，不要寒暄。";
+const DEFAULT_PROMPTS = {
+  system: "你是一位耐心的语言与考试辅导老师。学生是中文母语者，正在准备 JLPT N1、入学考试，并在背英语和韩语单词。请用简体中文讲解，日语/英语/韩语原文保留原样。讲解要准确、简洁、有条理，使用小标题和要点列表，不要寒暄。",
+  choice: "请解析这道题：为什么正确答案对，其他每个选项为什么不对（包括意思和用法区别），最后给出 1～2 个相关例句或记忆要点。",
+  flash: "请讲解这个词：发音、词性、核心意思、词根或词源（如有）、常见搭配或易混词，并给出至少三个用法不同的例句（附中文翻译）。",
+};
+// 自定义提示词存在云端（kind 'conf'），留空就用默认
+function prompts() { const c = get("conf_prompts")?.data || {}; const o = {}; for (const k in DEFAULT_PROMPTS) o[k] = (c[k] || "").trim() || DEFAULT_PROMPTS[k]; return o; }
 async function explain(card, userPick, onText) {
   const prov = PROVIDERS[settings.provider] ? settings.provider : "claude";
   if (!aiKey()) throw new Error(`还没有填写 ${PROVIDERS[prov].name} 的 API Key（设置 → AI 解析）`);
@@ -217,14 +223,16 @@ async function explain(card, userPick, onText) {
     content = `科目：${deck?.data.subject || deck?.data.name || ""}\n\n题目：\n${d.q}\n\n选项：\n${opts}\n\n正确答案：${d.answer + 1}. ${d.options[d.answer]}` +
       (userPick != null && userPick !== d.answer ? `\n我选了：${userPick + 1}. ${d.options[userPick]}（错了）` : "") +
       (d.note ? `\n\n题库自带的解析：${d.note}` : "") +
-      `\n\n请解析这道题：为什么正确答案对，其他每个选项为什么不对（包括意思和用法区别），最后给出 1～2 个相关例句或记忆要点。`;
+      `\n\n${prompts().choice}`;
   } else {
     content = `科目：${deck?.data.subject || deck?.data.name || ""}\n\n单词/卡片正面：${d.q}\n背面：${d.a || ""}` + (d.note ? `\n补充：${d.note}` : "") +
-      `\n\n请讲解这个词：发音、词性、核心意思、词根或词源（如有）、常见搭配或易混词，并给出至少三个用法不同的例句（附中文翻译）。`;
+      `\n\n${prompts().flash}`;
   }
-  return prov === "claude" ? explainClaude(content, onText) : explainOpenAICompat(prov, content, onText);
+  if (deck?.data.prompt?.trim()) content += `\n\n这个 session 的额外要求：${deck.data.prompt.trim()}`;
+  const system = prompts().system;
+  return prov === "claude" ? explainClaude(system, content, onText) : explainOpenAICompat(prov, system, content, onText);
 }
-async function explainClaude(content, onText) {
+async function explainClaude(system, content, onText) {
   if (!AnthropicCtor) AnthropicCtor = (await import(ANTHROPIC_ESM)).default;
   const client = new AnthropicCtor({ apiKey: aiKey(), dangerouslyAllowBrowser: true });
   const model = aiModel() || "claude-opus-5-5";
@@ -235,7 +243,7 @@ async function explainClaude(content, onText) {
     max_tokens: 8000,
     ...fb,
     output_config: { effort: settings.effort || "low" },
-    system: SYSTEM_PROMPT,
+    system,
     messages: [{ role: "user", content }],
   });
   stream.on("text", t => onText(t));
@@ -245,7 +253,7 @@ async function explainClaude(content, onText) {
   return { text, model: msg.model, at: Date.now() };
 }
 // DeepSeek / 通义千问 / 其他：OpenAI 兼容的 /chat/completions 接口（流式）
-async function explainOpenAICompat(prov, content, onText) {
+async function explainOpenAICompat(prov, system, content, onText) {
   const base = (prov === "custom" ? settings.customBase : PROVIDERS[prov].base || "").replace(/\/+$/, "");
   if (!base) throw new Error("请在设置里填写接口地址（Base URL）");
   const model = aiModel(); if (!model) throw new Error("请在设置里填写模型名称");
@@ -254,7 +262,7 @@ async function explainOpenAICompat(prov, content, onText) {
     res = await fetch(base + "/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + aiKey() },
-      body: JSON.stringify({ model, stream: true, max_tokens: 4000, messages: [{ role: "system", content: SYSTEM_PROMPT }, { role: "user", content }] }),
+      body: JSON.stringify({ model, stream: true, max_tokens: 4000, messages: [{ role: "system", content: system }, { role: "user", content }] }),
     });
   } catch (e) { throw new Error("连不上接口（网络问题，或这个服务不允许网页直接调用）"); }
   if (!res.ok) {
@@ -385,14 +393,13 @@ function deckEditView(id) {
   view().innerHTML = `<div class="card">
     <label>名称</label><input id="f-name" value="${esc(d.name)}" placeholder="例如：N1 文法">
     <label>科目说明（给 AI 看，让解析更准确）</label><input id="f-subject" value="${esc(d.subject || "")}" placeholder="例如：日语 JLPT N1 文法">
-    <div class="row"><div><label>每次刷题数量</label><input id="f-size" type="number" min="1" value="${d.sessionSize || 20}"></div>
-    <div><label>每天新题上限</label><input id="f-new" type="number" min="0" value="${d.newPerDay ?? 20}"></div></div>
+    <label>这个 session 的 AI 提示词（可选，会加在通用提示词后面）</label><textarea id="f-prompt" style="min-height:90px;font-family:inherit;font-size:15px" placeholder="例如：重点讲接续方式和近义文法的区别；例句尽量用新闻、商务场景">${esc(d.prompt || "")}</textarea>
     </div>
     <button id="save" style="width:100%">保存</button>
     ${deck ? `<div style="height:10px"></div><button id="del" class="danger" style="width:100%">删除这个 session（含所有卡片）</button>` : ""}`;
   $("#save").onclick = () => {
     const name = $("#f-name").value.trim(); if (!name) return toast("请填写名称");
-    const data = { ...d, name, subject: $("#f-subject").value.trim(), sessionSize: Math.max(1, +$("#f-size").value || 20), newPerDay: Math.max(0, +$("#f-new").value || 0) };
+    const data = { ...d, name, subject: $("#f-subject").value.trim(), prompt: $("#f-prompt").value.trim() };
     const nid = deck ? id : uid(); if (!deck) data.order = all("deck").length;
     put("deck", nid, data); location.hash = `#/deck/${nid}`;
   };
@@ -736,13 +743,15 @@ function settingsView() {
     </div>
     <div class="section-title">AI 解析</div>
     <div class="card" id="ai-card"></div>
+    <div class="section-title">AI 提示词</div>
+    <div class="card" id="prompt-card"></div>
     <div class="section-title">刷题</div>
     <div class="card"><label style="display:flex;gap:10px;align-items:center;color:var(--text);margin:0"><input id="shuf" type="checkbox" style="width:22px;height:22px" ${settings.shuffleOptions ? "checked" : ""}> 打乱选择题选项顺序</label></div>
     <div class="section-title">备份</div>
     <div class="card"><div class="row"><button id="export" class="secondary">导出备份</button><label class="btn secondary" style="margin:0">恢复备份<input id="restore" type="file" accept=".json" hidden></label></div></div>
     <div class="muted" style="text-align:center;margin-top:16px">刷题卡片 v1</div>`;
   $("#sb-save").onclick = async () => { settings.supabaseUrl = $("#sb-url").value.trim(); settings.supabaseKey = $("#sb-key").value.trim(); saveSettings(); await initSupabase(); settingsView(); toast("已保存"); };
-  renderAISettings();
+  renderAISettings(); renderPromptSettings();
   $("#shuf").onchange = e => { settings.shuffleOptions = e.target.checked; saveSettings(); };
   const auth = async (kind) => {
     const email = $("#em").value.trim(), password = $("#pw").value;
@@ -768,6 +777,23 @@ function settingsView() {
   };
 }
 
+function renderPromptSettings() {
+  const c = get("conf_prompts")?.data || {}; const P = prompts();
+  const field = (k, label, h) => `<label>${label}</label><textarea id="pr-${k}" style="min-height:${h}px;font-family:inherit;font-size:15px">${esc(P[k])}</textarea>
+    <div class="muted" style="display:flex;justify-content:space-between;margin-top:2px"><span>${(c[k] || "").trim() && c[k].trim() !== DEFAULT_PROMPTS[k] ? "已自定义" : "默认"}</span><a href="#" data-reset="${k}">恢复默认</a></div>`;
+  $("#prompt-card").innerHTML = `<div class="muted">AI 讲解时会按这里的要求来。每个 session 还可以在 ⋯ → 设置 里单独加要求。</div>
+    ${field("system", "AI 的角色和总体要求", 120)}
+    ${field("choice", "选择题怎么讲", 90)}
+    ${field("flash", "单词卡怎么讲", 90)}
+    <button id="pr-save" style="width:100%;margin-top:10px">保存提示词</button>
+    <div class="muted" style="margin-top:6px">改了提示词后，已经生成过的解析不会自动变，可以在解析下面点"重新生成"。</div>`;
+  const save = () => {
+    const data = {}; for (const k in DEFAULT_PROMPTS) { const v = $("#pr-" + k).value.trim(); data[k] = v === DEFAULT_PROMPTS[k] ? "" : v; }
+    put("conf", "conf_prompts", data); toast("提示词已保存"); renderPromptSettings();
+  };
+  $("#pr-save").onclick = save;
+  $("#prompt-card").querySelectorAll("[data-reset]").forEach(a => a.onclick = e => { e.preventDefault(); $("#pr-" + a.dataset.reset).value = DEFAULT_PROMPTS[a.dataset.reset]; save(); });
+}
 function renderAISettings() {
   const box = $("#ai-card"); const prov = PROVIDERS[settings.provider] ? settings.provider : "claude"; const P = PROVIDERS[prov];
   const cur = aiModel();
