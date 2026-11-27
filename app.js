@@ -17,6 +17,16 @@ function toast(msg, ms = 2200) {
 function shuffle(a) { a = a.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
 // ＿词＿ 或 <u>词</u> 显示为下划线
 function richQ(s) { return esc(s).replace(/＿([^＿\n]+)＿/g, '<span class="ul">$1</span>').replace(/&lt;u&gt;(.*?)&lt;\/u&gt;/g, '<span class="ul">$1</span>'); }
+// 把题目拆成「题干（作答要求）」和「正文」：第一段是短的说明就当作题干
+function splitQ(q) {
+  q = String(q || "");
+  const parts = q.split(/\n\s*\n/);
+  if (parts.length > 1 && parts[0].trim().length <= 80) return { stem: parts[0].trim(), body: parts.slice(1).join("\n\n").trim() };
+  const lines = q.split("\n");
+  if (lines.length > 1 && /(なさい|選べ|选择|选出|choose|select)[。.:：]?\s*$/i.test(lines[0].trim())) return { stem: lines[0].trim(), body: lines.slice(1).join("\n").trim() };
+  return { stem: "", body: q };
+}
+const qBody = q => splitQ(q).body;
 function md(s) {
   const lines = esc(s).split("\n"); let out = "", inList = false;
   const inline = t => t.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/`([^`]+)`/g, "<code>$1</code>");
@@ -100,7 +110,38 @@ function remove(ids) {
   for (const id of ids) { const old = items.get(id); if (!old) continue; const it = { ...old, deleted: true, updated_at: now, dirty: true }; items.set(id, it); its.push(it); }
   idbPutMany(its); scheduleSync();
 }
-const cardsOf = deckId => all("card").filter(c => c.data.deckId === deckId).sort((a, b) => (a.data.order ?? 0) - (b.data.order ?? 0));
+// ---------- 题库标签：考试 / 年份 / 题型 ----------
+// 卡片可带 exam("N1") src("2021-12") no(题号) mondai("問題1")；没有时从题目开头的【2021年12月 N1 問1】解析
+const MONDAI_NAMES = { N1: { "問題1": "漢字読み", "問題2": "文脈規定", "問題3": "言い換え類義", "問題4": "用法", "問題5": "文法形式の判断", "問題6": "文の組み立て", "問題7": "文章の文法" } };
+const MONDAI_ENDS = { N1: [6, 13, 19, 25, 35, 40, 45] }; // 2010 年后新题型每个大题的最后一题号
+const tagCache = new WeakMap();
+function tagsOf(d) {
+  if (tagCache.has(d)) return tagCache.get(d);
+  let t = null;
+  const m = /^【(\d{4})年(\d{1,2})月\s*(N\d)\s*問(\d+)】/.exec(d.q || "");
+  if (d.exam || m) {
+    const exam = d.exam || m[3], src = d.src || (m && `${m[1]}-${m[2].padStart(2, "0")}`), no = d.no ?? (m ? +m[4] : null);
+    let mondai = d.mondai || null;
+    if (!mondai && no != null && MONDAI_ENDS[exam]) { const i = MONDAI_ENDS[exam].findIndex(e => no <= e); if (i >= 0) mondai = `問題${i + 1}`; }
+    t = { exam, src, no, mondai };
+  }
+  tagCache.set(d, t);
+  return t;
+}
+const mondaiLabel = (exam, m) => `${m}${MONDAI_NAMES[exam]?.[m] ? " " + MONDAI_NAMES[exam][m] : ""}`;
+function matchFilter(d, f) {
+  const t = tagsOf(d); if (!t) return false;
+  if (f.exam && t.exam !== f.exam) return false;
+  if (f.mondai?.length && !f.mondai.includes(t.mondai)) return false;
+  if (f.src?.length && !f.src.includes(t.src)) return false;
+  return true;
+}
+const isFilterDeck = deckId => !!get(deckId)?.data.filter;
+const cardsOf = deckId => {
+  const f = get(deckId)?.data.filter;
+  if (f) return all("card").filter(c => matchFilter(c.data, f)).sort((a, b) => { const x = tagsOf(a.data), y = tagsOf(b.data); return (x.src || "").localeCompare(y.src || "") || (x.no ?? 0) - (y.no ?? 0); });
+  return all("card").filter(c => c.data.deckId === deckId).sort((a, b) => (a.data.order ?? 0) - (b.data.order ?? 0));
+};
 const progOf = cardId => get("p_" + cardId)?.data;
 
 // ---------- cloud sync (Supabase) ----------
@@ -193,7 +234,8 @@ function buildQueue(deckId, mode) {
   const deck = get(deckId); const size = deck?.data.sessionSize || 20; const newPerDay = deck?.data.newPerDay ?? 20;
   const now = Date.now();
   if (mode === "wrong") {
-    const ids = all("prog").filter(p => p.data.inBook && (!deckId || p.data.deckId === deckId)).map(p => p.data.cardId).filter(id => get(id));
+    const inDeck = deckId && isFilterDeck(deckId) ? new Set(cardsOf(deckId).map(c => c.id)) : null;
+    const ids = all("prog").filter(p => p.data.inBook && (!deckId || (inDeck ? inDeck.has(p.data.cardId) : p.data.deckId === deckId))).map(p => p.data.cardId).filter(id => get(id));
     return shuffle(ids);
   }
   const cards = cardsOf(deckId);
@@ -331,7 +373,9 @@ function answerIndex(ans, options) {
   return options.findIndex(o => o === s);
 }
 function normalizeCard(o) {
-  const q = o.q ?? o.question ?? o.front ?? o.word ?? o["题目"] ?? o["问题"] ?? o["正面"];
+  let q = o.q ?? o.question ?? o.front ?? o.word ?? o["题目"] ?? o["问题"] ?? o["正面"];
+  const stem = o.stem ?? o.instruction ?? o["题干"];
+  if (q && stem) q = `${stem}\n\n${q}`;
   const note = o.note ?? o.explanation ?? o["解析"] ?? o["备注"] ?? "";
   const options = o.options ?? o.choices ?? o["选项"];
   if (!q) return null;
@@ -414,19 +458,60 @@ function deckEditView(id) {
     <label>科目说明（给 AI 看，让解析更准确）</label><input id="f-subject" value="${esc(d.subject || "")}" placeholder="例如：日语 JLPT N1 文法">
     <label>这个 session 的 AI 提示词（可选，会加在通用提示词后面）</label><textarea id="f-prompt" style="min-height:90px;font-family:inherit;font-size:15px" placeholder="例如：重点讲接续方式和近义文法的区别；例句尽量用新闻、商务场景">${esc(d.prompt || "")}</textarea>
     </div>
+    ${filterBox(d.filter, !deck || !!d.filter)}
     <button id="save" style="width:100%">保存</button>
     ${deck ? `<div style="height:10px"></div><button id="del" class="danger" style="width:100%">删除这个 session（含所有卡片）</button>` : ""}`;
   $("#save").onclick = () => {
     const name = $("#f-name").value.trim(); if (!name) return toast("请填写名称");
     const data = { ...d, name, subject: $("#f-subject").value.trim(), prompt: $("#f-prompt").value.trim() };
+    const f = readFilter(); if (f) data.filter = f; else delete data.filter;
     const nid = deck ? id : uid(); if (!deck) data.order = all("deck").length;
     put("deck", nid, data); location.hash = `#/deck/${nid}`;
   };
+  wireFilterBox();
   if (deck) $("#del").onclick = () => {
+    if (d.filter) { if (!confirm(`确定删除「${d.name}」吗？（只删这个筛选 session，题库里的题目和做题记录都保留）`)) return; remove([id, "s_" + id].filter(x => items.has(x))); location.hash = "#/"; return; }
     if (!confirm(`确定删除「${d.name}」和里面的所有卡片吗？`)) return;
     const cs = cardsOf(id).map(c => c.id);
     remove([id, ...cs, ...cs.map(c => "p_" + c).filter(p => items.has(p))]); location.hash = "#/";
   };
+}
+
+// 新建 / 编辑 session 时的「从题库按题型筛选」
+function filterBox(f, show) {
+  if (!show) return "";
+  const tagged = all("card").map(c => tagsOf(c.data)).filter(Boolean);
+  if (!tagged.length) return "";
+  const exams = uniq(tagged.map(t => t.exam)).sort();
+  const exam = f?.exam || exams[0];
+  const ts = tagged.filter(t => t.exam === exam);
+  const count = (k, v) => ts.filter(t => t[k] === v).length;
+  const mondais = uniq(ts.map(t => t.mondai).filter(Boolean)).sort((a, b) => a.localeCompare(b, "ja", { numeric: true }));
+  const srcs = uniq(ts.map(t => t.src).filter(Boolean)).sort().reverse();
+  const chk = (k, v, label, on) => `<label class="chk"><input type="checkbox" data-f="${k}" value="${esc(v)}" ${on ? "checked" : ""}> ${esc(label)} <span class="muted">${count(k, v)}</span></label>`;
+  return `<div class="card" id="fbox">
+    <label class="chk" style="font-weight:600;color:var(--text)"><input type="checkbox" id="f-on" ${f ? "checked" : ""}> 从题库按题型 / 年份挑题</label>
+    <div class="muted">勾上后，这个 session 不放自己的卡片，而是自动收集题库里符合条件的题（以后导入的新题也会自动加进来）。</div>
+    <div id="f-body" style="${f ? "" : "display:none"}">
+      ${exams.length > 1 ? `<label>考试</label><select id="f-exam">${exams.map(e => `<option ${e === exam ? "selected" : ""}>${esc(e)}</option>`).join("")}</select>` : `<input type="hidden" id="f-exam" value="${esc(exam)}">`}
+      <label>题型（不勾 = 全部）</label>${mondais.map(m => chk("mondai", m, mondaiLabel(exam, m), f?.mondai?.includes(m))).join("")}
+      <label>年份（不勾 = 全部）</label>${srcs.map(v => chk("src", v, v.replace("-", " 年 ") + " 月", f?.src?.includes(v))).join("")}
+    </div></div>`;
+}
+function wireFilterBox() {
+  $("#f-on")?.addEventListener("change", e => { $("#f-body").style.display = e.target.checked ? "" : "none"; });
+  $("#f-exam")?.addEventListener("change", e => { $("#fbox").outerHTML = filterBox({ exam: e.target.value, mondai: [], src: [] }, true); wireFilterBox(); });
+}
+function readFilter() {
+  if (!$("#f-on")?.checked) return null;
+  const vals = k => [...view().querySelectorAll(`[data-f="${k}"]:checked`)].map(x => x.value);
+  return { exam: $("#f-exam").value, mondai: vals("mondai"), src: vals("src") };
+}
+function filterDesc(f) {
+  const parts = [f.exam];
+  parts.push(f.mondai?.length ? f.mondai.map(m => mondaiLabel(f.exam, m)).join("、") : "全部题型");
+  parts.push(f.src?.length ? f.src.join("、") : "全部年份");
+  return parts.join(" · ");
 }
 
 function deckView(id) {
@@ -443,7 +528,8 @@ function deckView(id) {
       <button id="go-reset" class="secondary" ${r.done ? "" : "disabled"}>从头再来一轮</button>
     </div>
     <div class="section-title">卡片</div>
-    <div class="row"><a class="btn secondary" href="#/card/${id}/new">＋ 添加</a><a class="btn secondary" href="#/import/${id}">批量导入</a><a class="btn secondary" href="#/deck-edit/${id}">设置</a></div>
+    ${deck.data.filter ? `<div class="muted" style="margin:0 4px 8px">筛选条件：${esc(filterDesc(deck.data.filter))}</div><div class="row"><a class="btn secondary" href="#/deck-edit/${id}">修改筛选 / 设置</a></div>`
+      : `<div class="row"><a class="btn secondary" href="#/card/${id}/new">＋ 添加</a><a class="btn secondary" href="#/import/${id}">批量导入</a><a class="btn secondary" href="#/deck-edit/${id}">设置</a></div>`}
     <div style="height:10px"></div>
     ${cards.length > 8 ? `<input id="search" placeholder="搜索卡片…" style="margin-bottom:8px">` : ""}
     <div class="card" id="clist">${cards.length ? "" : `<div class="empty">还没有卡片。可以手动添加，或者批量导入题库。</div>`}</div>`;
@@ -452,7 +538,8 @@ function deckView(id) {
     const shown = cards.filter(c => !f || (c.data.q + (c.data.a || "") + (c.data.options || []).join("")).includes(f));
     $("#clist").innerHTML = shown.slice(0, 300).map(c => {
       const p = progOf(c.id);
-      return `<a class="list-item" href="#/card/${id}/${c.id}" style="color:inherit;text-decoration:none"><span class="grow">${esc(c.data.q.replace(/\s+/g, " "))}</span>${p?.inBook ? '<span class="tag bad">错题</span>' : ""}<span class="tag">${c.data.type === "choice" ? "选择" : "卡片"}</span></a>`;
+      const t = tagsOf(c.data);
+      return `<a class="list-item" href="#/card/${c.data.deckId}/${c.id}" style="color:inherit;text-decoration:none"><span class="grow">${esc(qBody(c.data.q).replace(/\s+/g, " "))}</span>${p?.inBook ? '<span class="tag bad">错题</span>' : ""}<span class="tag">${t?.mondai ? esc(t.mondai) : c.data.type === "choice" ? "选择" : "卡片"}</span></a>`;
     }).join("") + (shown.length > 300 ? `<div class="muted">只显示前 300 张，请用搜索</div>` : "");
   };
   renderList();
@@ -470,7 +557,7 @@ function cardEditView(deckId, cardId) {
   const render = () => {
     view().innerHTML = `<div class="card">
       <div class="row"><button class="small ${type === "choice" ? "" : "ghost"}" data-t="choice">选择题</button><button class="small ${type === "flash" ? "" : "ghost"}" data-t="flash">单词卡（正反面）</button></div>
-      <label>${type === "choice" ? "题目（用 ＿词＿ 表示下划线）" : "正面（单词）"}</label><textarea id="f-q" style="min-height:90px;font-family:inherit;font-size:16px">${esc(d.q)}</textarea>
+      <label>${type === "choice" ? "题目（第一段写作答要求、空一行再写题目，会显示成小字；用 ＿词＿ 表示下划线）" : "正面（单词）"}</label><textarea id="f-q" style="min-height:90px;font-family:inherit;font-size:16px">${esc(d.q)}</textarea>
       ${type === "choice" ? `<label>选项（点圆圈选正确答案）</label>${(d.options || ["", "", "", ""]).map((o, i) => `
         <div class="row" style="align-items:center;margin-bottom:6px"><input type="radio" name="ans" value="${i}" ${d.answer === i ? "checked" : ""} style="flex:0 0 22px;width:22px;height:22px">
         <input class="f-opt" value="${esc(o)}" placeholder="选项 ${i + 1}" style="flex:1"></div>`).join("")}
@@ -512,7 +599,7 @@ function cardEditView(deckId, cardId) {
 }
 
 const AI_PROMPT = `请把下面的题目整理成 JSON 数组，每道选择题格式：
-{"q": "题目（下划线部分用＿词＿标出）", "options": ["选项1","选项2","选项3","选项4"], "answer": 正确选项的序号(1-4), "note": "解析(可选)"}
+{"stem": "作答要求（如：（　）に入れるのに最もよいものを選びなさい。）", "q": "题目正文（下划线部分用＿词＿标出）", "options": ["选项1","选项2","选项3","选项4"], "answer": 正确选项的序号(1-4), "note": "解析(可选)"}
 每个单词卡格式：{"q": "单词", "a": "读音 + 意思"}
 只输出 JSON，不要其他文字。`;
 
@@ -637,7 +724,8 @@ function studyView() {
     if (fresh) setTimeout(() => $("#after").scrollIntoView({ behavior: "smooth", block: "center" }), 50);
   };
   const renderChoice = () => {
-    view().innerHTML = `${head}<div class="card"><div class="q-text">${richQ(d.q)}</div>
+    const sq = splitQ(d.q);
+    view().innerHTML = `${head}<div class="card">${sq.stem ? `<div class="q-stem">${richQ(sq.stem)}</div>` : ""}<div class="q-text">${richQ(sq.body)}</div>
       <div class="opts">${order.map((oi, k) => `<button class="opt" data-i="${oi}"><span class="n">${k + 1}</span><span>${esc(d.options[oi])}</span></button>`).join("")}</div>
       <div id="after"></div></div><div class="study-actions" id="actions">${navRow.replace("下一题 →", "跳过 →")}</div>`;
     bindNav();
@@ -771,7 +859,7 @@ function wrongView() {
     <div class="muted" style="margin:8px 4px">答错的题会自动放进来，之后连续答对 2 次会自动移出。</div>` +
     Object.entries(byDeck).map(([did, ps]) => `<div class="section-title">${esc(get(did)?.data.name || "已删除")}</div><div class="card">
       <button class="small secondary" data-deck="${did}" style="width:100%;margin-bottom:6px">只练这个（${ps.length}）</button>
-      ${ps.sort((a, b) => b.data.wrong - a.data.wrong).map(p => { const c = get(p.data.cardId); return `<div class="list-item"><a class="grow" href="#/card/${did}/${c.id}" style="color:inherit;text-decoration:none">${esc(c.data.q.replace(/\s+/g, " "))}</a><span class="tag bad">错${p.data.wrong}次</span><button class="small ghost" data-out="${p.id}">移出</button></div>`; }).join("")}</div>`).join("")
+      ${ps.sort((a, b) => b.data.wrong - a.data.wrong).map(p => { const c = get(p.data.cardId); return `<div class="list-item"><a class="grow" href="#/card/${did}/${c.id}" style="color:inherit;text-decoration:none">${esc(qBody(c.data.q).replace(/\s+/g, " "))}</a><span class="tag bad">错${p.data.wrong}次</span><button class="small ghost" data-out="${p.id}">移出</button></div>`; }).join("")}</div>`).join("")
     : `<div class="empty">📕<br>错题本是空的<br>刷题时答错的题会自动放进来</div>`;
   $("#all")?.addEventListener("click", () => startStudy(null, "wrong"));
   view().querySelectorAll("[data-deck]").forEach(b => b.onclick = () => startStudy(b.dataset.deck, "wrong"));
@@ -933,7 +1021,7 @@ async function main() {
   window.addEventListener("hashchange", route);
   route();
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") syncNow(); else scheduleSync(500); });
-  if ("serviceWorker" in navigator && location.protocol === "https:") {
+  if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost")) {
     const hadSW = !!navigator.serviceWorker.controller;
     navigator.serviceWorker.register("sw.js", { updateViaCache: "none" }).then(r => r.update()).catch(() => {});
     // 有新版本时自动刷新一次
