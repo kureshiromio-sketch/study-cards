@@ -764,6 +764,12 @@ async function main() {
   window.addEventListener("hashchange", route);
   route();
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") syncNow(); else scheduleSync(500); });
-  if ("serviceWorker" in navigator && location.protocol === "https:") navigator.serviceWorker.register("sw.js").catch(() => {});
+  if ("serviceWorker" in navigator && location.protocol === "https:") {
+    const hadSW = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.register("sw.js", { updateViaCache: "none" }).then(r => r.update()).catch(() => {});
+    // 有新版本时自动刷新一次
+    let reloaded = false;
+    navigator.serviceWorker.addEventListener("controllerchange", () => { if (hadSW && !reloaded && !document.body.classList.contains("studying")) { reloaded = true; location.reload(); } });
+  }
 }
 main().catch(e => { console.error(e); view().innerHTML = `<div class="empty">启动失败：${esc(e.message)}</div>`; });
