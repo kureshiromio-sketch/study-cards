@@ -35,9 +35,22 @@ function md(s) {
 
 // ---------- settings (per device) ----------
 const SETTINGS_KEY = "sc_settings";
-const defaults = { apiKey: "", model: "claude-opus-5-5", effort: "low", supabaseUrl: "", supabaseKey: "", shuffleOptions: true };
+const defaults = { provider: "claude", keys: {}, models: {}, customBase: "", apiKey: "", model: "claude-opus-5-5", effort: "low", supabaseUrl: "", supabaseKey: "", shuffleOptions: true };
 let settings = { ...defaults };
 try { Object.assign(settings, JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}")); } catch {}
+// 旧版本只存了 Claude 的 key
+if (settings.apiKey && !settings.keys?.claude) { settings.keys = { ...(settings.keys || {}), claude: settings.apiKey }; settings.models = { ...(settings.models || {}), claude: settings.model }; }
+const PROVIDERS = {
+  claude: { name: "Claude（Anthropic）", keyHint: "sk-ant-…", keyUrl: "https://console.anthropic.com",
+    models: [["claude-opus-5-5", "Claude Opus 5.5（最准确）"], ["claude-sonnet-5-5", "Claude Sonnet 5.5（便宜一半）"], ["claude-haiku-5-5", "Claude Haiku 5.5（最便宜最快）"]] },
+  deepseek: { name: "DeepSeek", base: "https://api.deepseek.com/v1", keyHint: "sk-…", keyUrl: "https://platform.deepseek.com",
+    models: [["deepseek-chat", "deepseek-chat（快）"], ["deepseek-reasoner", "deepseek-reasoner（会先思考，慢一些）"]] },
+  qwen: { name: "通义千问（阿里云百炼）", base: "https://dashscope.aliyuncs.com/compatible-mode/v1", keyHint: "sk-…", keyUrl: "https://bailian.console.aliyun.com",
+    models: [["qwen-plus", "qwen-plus（推荐）"], ["qwen-max", "qwen-max（最强）"], ["qwen-turbo", "qwen-turbo（最便宜）"]] },
+  custom: { name: "其他（OpenAI 兼容接口）", keyHint: "API Key", models: [] },
+};
+const aiKey = () => (settings.keys || {})[settings.provider] || "";
+const aiModel = () => (settings.models || {})[settings.provider] || PROVIDERS[settings.provider]?.models[0]?.[0] || "";
 const saveSettings = () => { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {} };
 const sbUrl = () => settings.supabaseUrl || window.APP_CONFIG?.SUPABASE_URL || "";
 const sbKey = () => settings.supabaseKey || window.APP_CONFIG?.SUPABASE_ANON_KEY || "";
@@ -192,10 +205,10 @@ function buildQueue(deckId, mode) {
 
 // ---------- AI explanation ----------
 let AnthropicCtor = null;
+const SYSTEM_PROMPT = "你是一位耐心的语言与考试辅导老师。学生是中文母语者，正在准备 JLPT N1、入学考试，并在背英语和韩语单词。请用简体中文讲解，日语/英语/韩语原文保留原样。讲解要准确、简洁、有条理，使用小标题和要点列表，不要寒暄。";
 async function explain(card, userPick, onText) {
-  if (!settings.apiKey) throw new Error("还没有填写 Anthropic API Key（设置 → AI 解析）");
-  if (!AnthropicCtor) AnthropicCtor = (await import(ANTHROPIC_ESM)).default;
-  const client = new AnthropicCtor({ apiKey: settings.apiKey, dangerouslyAllowBrowser: true });
+  const prov = PROVIDERS[settings.provider] ? settings.provider : "claude";
+  if (!aiKey()) throw new Error(`还没有填写 ${PROVIDERS[prov].name} 的 API Key（设置 → AI 解析）`);
   const deck = get(card.data.deckId);
   const d = card.data;
   let content;
@@ -209,7 +222,12 @@ async function explain(card, userPick, onText) {
     content = `科目：${deck?.data.subject || deck?.data.name || ""}\n\n单词/卡片正面：${d.q}\n背面：${d.a || ""}` + (d.note ? `\n补充：${d.note}` : "") +
       `\n\n请讲解这个词：发音、词性、核心意思、词根或词源（如有）、常见搭配或易混词，并给出至少三个用法不同的例句（附中文翻译）。`;
   }
-  const model = settings.model || "claude-opus-5-5";
+  return prov === "claude" ? explainClaude(content, onText) : explainOpenAICompat(prov, content, onText);
+}
+async function explainClaude(content, onText) {
+  if (!AnthropicCtor) AnthropicCtor = (await import(ANTHROPIC_ESM)).default;
+  const client = new AnthropicCtor({ apiKey: aiKey(), dangerouslyAllowBrowser: true });
+  const model = aiModel() || "claude-opus-5-5";
   // Opus / Sonnet: if a safety filter declines, the server retries on a fallback model automatically
   const fb = model.startsWith("claude-haiku") ? {} : { betas: ["server-side-fallback-2026-07-01"], fallbacks: "default" };
   const stream = client.beta.messages.stream({
@@ -217,7 +235,7 @@ async function explain(card, userPick, onText) {
     max_tokens: 8000,
     ...fb,
     output_config: { effort: settings.effort || "low" },
-    system: "你是一位耐心的语言与考试辅导老师。学生是中文母语者，正在准备 JLPT N1、入学考试，并在背英语和韩语单词。请用简体中文讲解，日语/英语/韩语原文保留原样。讲解要准确、简洁、有条理，使用小标题和要点列表，不要寒暄。",
+    system: SYSTEM_PROMPT,
     messages: [{ role: "user", content }],
   });
   stream.on("text", t => onText(t));
@@ -225,6 +243,38 @@ async function explain(card, userPick, onText) {
   if (msg.stop_reason === "refusal") throw new Error("AI 拒绝回答这道题");
   const text = msg.content.filter(b => b.type === "text").map(b => b.text).join("");
   return { text, model: msg.model, at: Date.now() };
+}
+// DeepSeek / 通义千问 / 其他：OpenAI 兼容的 /chat/completions 接口（流式）
+async function explainOpenAICompat(prov, content, onText) {
+  const base = (prov === "custom" ? settings.customBase : PROVIDERS[prov].base || "").replace(/\/+$/, "");
+  if (!base) throw new Error("请在设置里填写接口地址（Base URL）");
+  const model = aiModel(); if (!model) throw new Error("请在设置里填写模型名称");
+  let res;
+  try {
+    res = await fetch(base + "/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + aiKey() },
+      body: JSON.stringify({ model, stream: true, max_tokens: 4000, messages: [{ role: "system", content: SYSTEM_PROMPT }, { role: "user", content }] }),
+    });
+  } catch (e) { throw new Error("连不上接口（网络问题，或这个服务不允许网页直接调用）"); }
+  if (!res.ok) {
+    let msg = ""; try { const j = await res.json(); msg = j.error?.message || j.message || JSON.stringify(j); } catch {}
+    const err = new Error(`${res.status} ${msg}`.trim()); err.status = res.status; throw err;
+  }
+  const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = "", text = "";
+  for (;;) {
+    const { value, done } = await reader.read(); if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+      if (!line.startsWith("data:")) continue;
+      const data = line.slice(5).trim(); if (data === "[DONE]") continue;
+      try { const t = JSON.parse(data).choices?.[0]?.delta?.content; if (t) { text += t; onText(t); } } catch {}
+    }
+  }
+  if (!text) throw new Error("接口没有返回内容");
+  return { text, model, at: Date.now() };
 }
 
 // ---------- import ----------
@@ -632,7 +682,7 @@ async function runAI(card, pick) {
     let msg = e?.message || String(e);
     if (e?.status === 401) msg = "API Key 不正确，请到设置里检查";
     else if (e?.status === 429) msg = "请求太频繁或额度不足，稍后再试";
-    else if (/credit|billing|balance/i.test(msg)) msg = "Anthropic 账户余额不足，请先充值";
+    else if (e?.status === 402 || /credit|billing|balance|余额|arrearage/i.test(msg)) msg = "AI 账户余额不足，请先充值";
     box.innerHTML = `<div class="note" style="color:var(--bad)">解析失败：${esc(msg)}</div>`;
     btn.disabled = false; btn.textContent = "重试解析";
   }
@@ -685,24 +735,14 @@ function settingsView() {
       </details>
     </div>
     <div class="section-title">AI 解析</div>
-    <div class="card">
-      <label>Anthropic API Key（只保存在这台设备上）</label><input id="key" type="password" value="${esc(settings.apiKey)}" placeholder="sk-ant-…">
-      <label>模型</label><select id="model">
-        ${[["claude-opus-5-5", "Claude Opus 5.5（最准确）"], ["claude-sonnet-5-5", "Claude Sonnet 5.5（便宜一半）"], ["claude-haiku-5-5", "Claude Haiku 5.5（最便宜最快）"]].map(([v, t]) => `<option value="${v}" ${settings.model === v ? "selected" : ""}>${t}</option>`).join("")}
-      </select>
-      <label>思考深度</label><select id="effort">
-        ${[["low", "快速（推荐）"], ["medium", "标准"], ["high", "深入（更慢）"]].map(([v, t]) => `<option value="${v}" ${settings.effort === v ? "selected" : ""}>${t}</option>`).join("")}
-      </select>
-      <div class="muted" style="margin-top:8px">同一道题的解析会被保存，第二次查看不再花钱。</div>
-      <button id="key-save" style="width:100%;margin-top:10px">保存</button>
-    </div>
+    <div class="card" id="ai-card"></div>
     <div class="section-title">刷题</div>
     <div class="card"><label style="display:flex;gap:10px;align-items:center;color:var(--text);margin:0"><input id="shuf" type="checkbox" style="width:22px;height:22px" ${settings.shuffleOptions ? "checked" : ""}> 打乱选择题选项顺序</label></div>
     <div class="section-title">备份</div>
     <div class="card"><div class="row"><button id="export" class="secondary">导出备份</button><label class="btn secondary" style="margin:0">恢复备份<input id="restore" type="file" accept=".json" hidden></label></div></div>
     <div class="muted" style="text-align:center;margin-top:16px">刷题卡片 v1</div>`;
   $("#sb-save").onclick = async () => { settings.supabaseUrl = $("#sb-url").value.trim(); settings.supabaseKey = $("#sb-key").value.trim(); saveSettings(); await initSupabase(); settingsView(); toast("已保存"); };
-  $("#key-save").onclick = () => { settings.apiKey = $("#key").value.trim(); settings.model = $("#model").value; settings.effort = $("#effort").value; saveSettings(); toast("已保存"); };
+  renderAISettings();
   $("#shuf").onchange = e => { settings.shuffleOptions = e.target.checked; saveSettings(); };
   const auth = async (kind) => {
     const email = $("#em").value.trim(), password = $("#pw").value;
@@ -725,6 +765,33 @@ function settingsView() {
     const f = e.target.files[0]; if (!f) return;
     try { const list = JSON.parse(await f.text()); putMany(list.filter(x => x.id && x.kind).map(x => ({ kind: x.kind, id: x.id, data: x.data }))); toast(`已恢复 ${list.length} 条`); }
     catch (err) { toast("文件无法识别"); }
+  };
+}
+
+function renderAISettings() {
+  const box = $("#ai-card"); const prov = PROVIDERS[settings.provider] ? settings.provider : "claude"; const P = PROVIDERS[prov];
+  const cur = aiModel();
+  const preset = P.models.some(m => m[0] === cur);
+  box.innerHTML = `
+    <label>用哪家的 AI</label><select id="prov">${Object.entries(PROVIDERS).map(([k, v]) => `<option value="${k}" ${k === prov ? "selected" : ""}>${v.name}</option>`).join("")}</select>
+    ${prov === "custom" ? `<label>接口地址（Base URL，一般以 /v1 结尾）</label><input id="base" value="${esc(settings.customBase)}" placeholder="https://…/v1">` : ""}
+    <label>API Key（只保存在这台设备上）</label><input id="key" type="password" value="${esc(aiKey())}" placeholder="${P.keyHint}">
+    ${P.keyUrl ? `<div class="muted" style="margin-top:4px">在这里申请：${P.keyUrl}</div>` : ""}
+    <label>模型</label>
+    ${P.models.length ? `<select id="model">${P.models.map(([v, t]) => `<option value="${v}" ${cur === v ? "selected" : ""}>${t}</option>`).join("")}<option value="__other" ${!preset && cur ? "selected" : ""}>其他（手动填写）</option></select>` : ""}
+    <input id="model-txt" value="${esc(preset ? "" : cur)}" placeholder="模型名称，例如 qwen-plus" style="margin-top:6px;${P.models.length && preset ? "display:none" : ""}">
+    ${prov === "claude" ? `<label>思考深度</label><select id="effort">${[["low", "快速（推荐）"], ["medium", "标准"], ["high", "深入（更慢）"]].map(([v, t]) => `<option value="${v}" ${settings.effort === v ? "selected" : ""}>${t}</option>`).join("")}</select>` : ""}
+    <div class="muted" style="margin-top:8px">同一道题的解析会被保存，第二次查看不再花钱。</div>
+    <button id="key-save" style="width:100%;margin-top:10px">保存</button>`;
+  $("#prov").onchange = e => { settings.provider = e.target.value; saveSettings(); renderAISettings(); };
+  $("#model")?.addEventListener("change", e => { $("#model-txt").style.display = e.target.value === "__other" ? "" : "none"; });
+  $("#key-save").onclick = () => {
+    settings.keys = { ...(settings.keys || {}), [prov]: $("#key").value.trim() };
+    const sel = $("#model")?.value; const m = !sel || sel === "__other" ? $("#model-txt").value.trim() : sel;
+    settings.models = { ...(settings.models || {}), [prov]: m };
+    if (prov === "custom") settings.customBase = $("#base").value.trim();
+    if ($("#effort")) settings.effort = $("#effort").value;
+    saveSettings(); toast("已保存");
   };
 }
 
