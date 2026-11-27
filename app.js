@@ -20,11 +20,11 @@ function playSound(kind) {
     const AudioContext = window.AudioContext || window.webkitAudioContext;
     if (!AudioContext) return;
     audioCtx ||= new AudioContext();
-    if (audioCtx.state === "suspended") audioCtx.resume();
+    const runSound = () => {
     const sounds = {
-      click: [[720, 0, 0.04, 0.025]],
-      correct: [[660, 0.05, 0.11, 0.05], [880, 0.18, 0.15, 0.05]],
-      wrong: [[220, 0.05, 0.13, 0.045], [165, 0.20, 0.17, 0.045]],
+      click: [[720, 0, 0.04, 0.08]],
+      correct: [[660, 0.05, 0.11, 0.12], [880, 0.18, 0.15, 0.12]],
+      wrong: [[220, 0.05, 0.13, 0.11], [165, 0.20, 0.17, 0.11]],
     };
     const now = audioCtx.currentTime;
     for (const [frequency, delay, duration, volume] of sounds[kind] || []) {
@@ -40,7 +40,10 @@ function playSound(kind) {
       oscillator.start(now + delay);
       oscillator.stop(now + delay + duration + 0.01);
     }
-  } catch {}
+      };
+    if (audioCtx.state === "suspended") audioCtx.resume().then(runSound).catch(() => {});
+    else runSound();
+} catch {}
 }
 function shuffle(a) { a = a.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
 // ＿词＿ 或 <u>词</u> 显示为下划线
