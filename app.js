@@ -1,0 +1,686 @@
+import { SAMPLE_DECKS } from "./samples.js";
+
+const SUPABASE_ESM = "./vendor/supabase.js";
+const ANTHROPIC_ESM = "./vendor/anthropic.js";
+const DAY = 86400000;
+const INTERVALS = [0, 1, 2, 4, 8, 16, 32, 64].map(d => d * DAY);
+
+// ---------- helpers ----------
+const $ = (s, el = document) => el.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
+const startOfToday = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); };
+function toast(msg, ms = 2200) {
+  const t = $("#toast"); t.textContent = msg; t.classList.add("show");
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove("show"), ms);
+}
+function shuffle(a) { a = a.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+// ＿词＿ 或 <u>词</u> 显示为下划线
+function richQ(s) { return esc(s).replace(/＿([^＿\n]+)＿/g, '<span class="ul">$1</span>').replace(/&lt;u&gt;(.*?)&lt;\/u&gt;/g, '<span class="ul">$1</span>'); }
+function md(s) {
+  const lines = esc(s).split("\n"); let out = "", inList = false;
+  const inline = t => t.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/`([^`]+)`/g, "<code>$1</code>");
+  for (const raw of lines) {
+    const l = raw.trimEnd();
+    const li = l.match(/^\s*(?:[-*•]|\d+[.)])\s+(.*)/);
+    if (li) { if (!inList) { out += "<ul>"; inList = true; } out += `<li>${inline(li[1])}</li>`; continue; }
+    if (inList) { out += "</ul>"; inList = false; }
+    const h = l.match(/^#{1,4}\s+(.*)/);
+    if (h) out += `<h4>${inline(h[1])}</h4>`;
+    else if (l.trim()) out += `<p>${inline(l)}</p>`;
+  }
+  if (inList) out += "</ul>";
+  return out;
+}
+
+// ---------- settings (per device) ----------
+const SETTINGS_KEY = "sc_settings";
+const defaults = { apiKey: "", model: "claude-opus-5-5", effort: "low", supabaseUrl: "", supabaseKey: "", shuffleOptions: true };
+let settings = { ...defaults };
+try { Object.assign(settings, JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}")); } catch {}
+const saveSettings = () => { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {} };
+const sbUrl = () => settings.supabaseUrl || window.APP_CONFIG?.SUPABASE_URL || "";
+const sbKey = () => settings.supabaseKey || window.APP_CONFIG?.SUPABASE_ANON_KEY || "";
+
+// ---------- local store (IndexedDB) ----------
+// item: { id, kind: 'deck'|'card'|'prog', data, updated_at, deleted, dirty }
+const items = new Map();
+let idb;
+function openDB() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open("study-cards", 1);
+    r.onupgradeneeded = () => { r.result.createObjectStore("items", { keyPath: "id" }); r.result.createObjectStore("meta"); };
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+  });
+}
+function idbPutMany(list) {
+  if (!list.length) return Promise.resolve();
+  return new Promise((res, rej) => {
+    const tx = idb.transaction("items", "readwrite"); const st = tx.objectStore("items");
+    for (const it of list) st.put(it);
+    tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+  });
+}
+function idbAll() {
+  return new Promise((res, rej) => { const r = idb.transaction("items").objectStore("items").getAll(); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+}
+function meta(key, val) {
+  return new Promise((res, rej) => {
+    const tx = idb.transaction("meta", val === undefined ? "readonly" : "readwrite"); const st = tx.objectStore("meta");
+    const r = val === undefined ? st.get(key) : st.put(val, key);
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+  });
+}
+const live = it => it && !it.deleted;
+function all(kind) { const out = []; for (const it of items.values()) if (it.kind === kind && live(it)) out.push(it); return out; }
+function get(id) { const it = items.get(id); return live(it) ? it : null; }
+function put(kind, id, data) {
+  const it = { id, kind, data, updated_at: Date.now(), deleted: false, dirty: true };
+  items.set(id, it); idbPutMany([it]); scheduleSync(); return it;
+}
+function putMany(list) { // [{kind,id,data}]
+  const now = Date.now(); const its = list.map(x => ({ id: x.id, kind: x.kind, data: x.data, updated_at: now, deleted: false, dirty: true }));
+  its.forEach(it => items.set(it.id, it)); idbPutMany(its); scheduleSync(); return its;
+}
+function remove(ids) {
+  const now = Date.now(); const its = [];
+  for (const id of ids) { const old = items.get(id); if (!old) continue; const it = { ...old, deleted: true, updated_at: now, dirty: true }; items.set(id, it); its.push(it); }
+  idbPutMany(its); scheduleSync();
+}
+const cardsOf = deckId => all("card").filter(c => c.data.deckId === deckId).sort((a, b) => (a.data.order ?? 0) - (b.data.order ?? 0));
+const progOf = cardId => get("p_" + cardId)?.data;
+
+// ---------- cloud sync (Supabase) ----------
+let sb = null, sbUser = null, syncing = false, syncTimer = null;
+const setDot = s => { const d = $("#sync-dot"); d.className = s || ""; };
+async function initSupabase() {
+  if (!sbUrl() || !sbKey()) { sb = null; sbUser = null; setDot(""); return; }
+  try {
+    const { createClient } = await import(SUPABASE_ESM);
+    sb = createClient(sbUrl(), sbKey(), { auth: { persistSession: true, autoRefreshToken: true } });
+    const { data } = await sb.auth.getSession();
+    sbUser = data.session?.user || null;
+    sb.auth.onAuthStateChange((_e, session) => { sbUser = session?.user || null; });
+  } catch (e) { console.error(e); sb = null; setDot("err"); }
+}
+function scheduleSync(delay = 4000) { if (!sb || !sbUser) return; clearTimeout(syncTimer); syncTimer = setTimeout(() => syncNow(), delay); }
+async function syncNow(manual = false) {
+  if (!sb || !sbUser) { if (manual) toast("请先在设置里登录云同步"); return; }
+  if (syncing) return; syncing = true; setDot("busy");
+  try {
+    const metaKey = "lastPull_" + sbUser.id;
+    let since = (await meta(metaKey)) || "1970-01-01T00:00:00Z";
+    // pull
+    let changed = false;
+    for (;;) {
+      const { data, error } = await sb.from("items").select("id,kind,data,updated_at,deleted,server_ts").gt("server_ts", since).order("server_ts").limit(1000);
+      if (error) throw error;
+      const toSave = [];
+      for (const r of data) {
+        const cur = items.get(r.id);
+        const ru = Number(r.updated_at);
+        if (!cur || !cur.dirty || ru >= cur.updated_at) {
+          const it = { id: r.id, kind: r.kind, data: r.data, updated_at: ru, deleted: r.deleted, dirty: false };
+          items.set(r.id, it); toSave.push(it); changed = true;
+        }
+        since = r.server_ts;
+      }
+      await idbPutMany(toSave);
+      if (data.length < 1000) break;
+    }
+    await meta(metaKey, since);
+    // push
+    const dirty = [...items.values()].filter(it => it.dirty);
+    for (let i = 0; i < dirty.length; i += 500) {
+      const chunk = dirty.slice(i, i + 500);
+      const rows = chunk.map(it => ({ user_id: sbUser.id, id: it.id, kind: it.kind, data: it.data, updated_at: it.updated_at, deleted: it.deleted }));
+      const { error } = await sb.from("items").upsert(rows, { onConflict: "user_id,id" });
+      if (error) throw error;
+      const saved = [];
+      for (const it of chunk) { const cur = items.get(it.id); if (cur && cur.updated_at === it.updated_at) { cur.dirty = false; saved.push(cur); } }
+      await idbPutMany(saved);
+    }
+    setDot("ok");
+    if (manual) toast("同步完成");
+    if (changed && !document.body.classList.contains("studying")) route();
+  } catch (e) {
+    console.error(e); setDot("err"); if (manual) toast("同步失败：" + (e.message || e));
+  } finally { syncing = false; }
+}
+
+// ---------- spaced repetition ----------
+function grade(card, correct) {
+  const now = Date.now();
+  const p = { ...(progOf(card.id) || { cardId: card.id, deckId: card.data.deckId, box: 0, seen: 0, right: 0, wrong: 0, streak: 0, inBook: false, firstAt: now }) };
+  p.deckId = card.data.deckId; p.seen++; p.lastAt = now;
+  if (correct) {
+    p.right++; p.streak++; p.box = Math.min(p.box + 1, INTERVALS.length - 1); p.due = now + INTERVALS[p.box];
+    if (p.inBook && p.streak >= 2) p.inBook = false; // 连续答对 2 次自动移出错题本
+  } else {
+    p.wrong++; p.streak = 0; p.box = 0; p.due = now + 10 * 60000; p.inBook = true;
+  }
+  put("prog", "p_" + card.id, p);
+  return p;
+}
+function deckStats(deckId) {
+  const cards = cardsOf(deckId); const now = Date.now(); const today = startOfToday();
+  let fresh = 0, due = 0, book = 0, newToday = 0;
+  for (const c of cards) {
+    const p = progOf(c.id);
+    if (!p) fresh++; else { if (p.due <= now) due++; if (p.inBook) book++; if (p.firstAt >= today) newToday++; }
+  }
+  return { total: cards.length, fresh, due, book, newToday };
+}
+function buildQueue(deckId, mode) {
+  const deck = get(deckId); const size = deck?.data.sessionSize || 20; const newPerDay = deck?.data.newPerDay ?? 20;
+  const now = Date.now();
+  if (mode === "wrong") {
+    const ids = all("prog").filter(p => p.data.inBook && (!deckId || p.data.deckId === deckId)).map(p => p.data.cardId).filter(id => get(id));
+    return shuffle(ids);
+  }
+  const cards = cardsOf(deckId);
+  if (mode === "random") return shuffle(cards.map(c => c.id)).slice(0, size);
+  const due = [], fresh = [];
+  for (const c of cards) { const p = progOf(c.id); if (!p) fresh.push(c.id); else if (p.due <= now) due.push([p.due, c.id]); }
+  due.sort((a, b) => a[0] - b[0]);
+  const st = deckStats(deckId);
+  const newAllowed = Math.max(0, newPerDay - st.newToday);
+  const q = due.map(x => x[1]).slice(0, size);
+  for (const id of fresh) { if (q.length >= size || q.length - Math.min(due.length, size) >= newAllowed) break; q.push(id); }
+  return shuffle(q);
+}
+
+// ---------- AI explanation ----------
+let AnthropicCtor = null;
+async function explain(card, userPick, onText) {
+  if (!settings.apiKey) throw new Error("还没有填写 Anthropic API Key（设置 → AI 解析）");
+  if (!AnthropicCtor) AnthropicCtor = (await import(ANTHROPIC_ESM)).default;
+  const client = new AnthropicCtor({ apiKey: settings.apiKey, dangerouslyAllowBrowser: true });
+  const deck = get(card.data.deckId);
+  const d = card.data;
+  let content;
+  if (d.type === "choice") {
+    const opts = d.options.map((o, i) => `${i + 1}. ${o}`).join("\n");
+    content = `科目：${deck?.data.subject || deck?.data.name || ""}\n\n题目：\n${d.q}\n\n选项：\n${opts}\n\n正确答案：${d.answer + 1}. ${d.options[d.answer]}` +
+      (userPick != null && userPick !== d.answer ? `\n我选了：${userPick + 1}. ${d.options[userPick]}（错了）` : "") +
+      (d.note ? `\n\n题库自带的解析：${d.note}` : "") +
+      `\n\n请解析这道题：为什么正确答案对，其他每个选项为什么不对（包括意思和用法区别），最后给出 1～2 个相关例句或记忆要点。`;
+  } else {
+    content = `科目：${deck?.data.subject || deck?.data.name || ""}\n\n单词/卡片正面：${d.q}\n背面：${d.a || ""}` + (d.note ? `\n补充：${d.note}` : "") +
+      `\n\n请讲解这个词：发音、词性、核心意思、词根或词源（如有）、常见搭配或易混词，并给出至少三个用法不同的例句（附中文翻译）。`;
+  }
+  const model = settings.model || "claude-opus-5-5";
+  // Opus / Sonnet: if a safety filter declines, the server retries on a fallback model automatically
+  const fb = model.startsWith("claude-haiku") ? {} : { betas: ["server-side-fallback-2026-07-01"], fallbacks: "default" };
+  const stream = client.beta.messages.stream({
+    model,
+    max_tokens: 8000,
+    ...fb,
+    output_config: { effort: settings.effort || "low" },
+    system: "你是一位耐心的语言与考试辅导老师。学生是中文母语者，正在准备 JLPT N1、入学考试，并在背英语和韩语单词。请用简体中文讲解，日语/英语/韩语原文保留原样。讲解要准确、简洁、有条理，使用小标题和要点列表，不要寒暄。",
+    messages: [{ role: "user", content }],
+  });
+  stream.on("text", t => onText(t));
+  const msg = await stream.finalMessage();
+  if (msg.stop_reason === "refusal") throw new Error("AI 拒绝回答这道题");
+  const text = msg.content.filter(b => b.type === "text").map(b => b.text).join("");
+  return { text, model: msg.model, at: Date.now() };
+}
+
+// ---------- import ----------
+function parseCSV(text) {
+  const rows = []; let row = [], cell = "", q = false, delim = ",";
+  const pickDelim = i => { const e = text.indexOf("\n", i); const line = text.slice(i, e < 0 ? undefined : e); delim = line.includes("\t") ? "\t" : ","; };
+  pickDelim(0);
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (!q && row.length === 0 && cell === "" && (i === 0 || text[i - 1] === "\n")) pickDelim(i);
+    if (q) { if (ch === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else q = false; } else cell += ch; continue; }
+    if (ch === '"' && cell === "") q = true;
+    else if (ch === delim) { row.push(cell); cell = ""; }
+    else if (ch === "\n" || ch === "\r") { if (ch === "\r" && text[i + 1] === "\n") i++; row.push(cell); rows.push(row); row = []; cell = ""; }
+    else cell += ch;
+  }
+  if (cell !== "" || row.length) { row.push(cell); rows.push(row); }
+  return rows.map(r => r.map(c => c.trim())).filter(r => r.some(c => c));
+}
+function answerIndex(ans, options) {
+  if (ans == null) return -1;
+  if (typeof ans === "number") return ans >= 1 && ans <= options.length ? ans - 1 : -1;
+  const s = String(ans).trim();
+  const L = "ABCDEFGH".indexOf(s.toUpperCase()); if (s.length === 1 && L >= 0 && L < options.length) return L;
+  const circled = "①②③④⑤⑥".indexOf(s); if (circled >= 0) return circled;
+  if (/^\d+$/.test(s)) { const n = +s; return n >= 1 && n <= options.length ? n - 1 : -1; }
+  return options.findIndex(o => o === s);
+}
+function normalizeCard(o) {
+  const q = o.q ?? o.question ?? o.front ?? o.word ?? o["题目"] ?? o["问题"] ?? o["正面"];
+  const note = o.note ?? o.explanation ?? o["解析"] ?? o["备注"] ?? "";
+  const options = o.options ?? o.choices ?? o["选项"];
+  if (!q) return null;
+  if (Array.isArray(options) && options.length >= 2) {
+    const opts = options.map(String);
+    const answer = answerIndex(o.answer ?? o.ans ?? o["答案"], opts);
+    if (answer < 0) return { error: `「${String(q).slice(0, 20)}」的答案无法识别` };
+    return { type: "choice", q: String(q), options: opts, answer, note: String(note || "") };
+  }
+  const a = o.a ?? o.back ?? o.meaning ?? o.answer ?? o["背面"] ?? o["意思"] ?? o["答案"] ?? "";
+  return { type: "flash", q: String(q), a: String(a), note: String(note || "") };
+}
+function parseImport(text) {
+  text = text.trim(); const cards = [], errors = [];
+  if (!text) return { cards, errors };
+  if (text.startsWith("[") || text.startsWith("{")) {
+    let j = JSON.parse(text); if (!Array.isArray(j)) j = j.cards || [j];
+    for (const o of j) { const c = normalizeCard(o); if (!c) errors.push("缺少题目"); else if (c.error) errors.push(c.error); else cards.push(c); }
+    return { cards, errors };
+  }
+  const rows = parseCSV(text);
+  const head = rows[0].map(h => h.toLowerCase());
+  const known = ["q", "question", "front", "word", "题目", "问题", "正面"];
+  if (head.some(h => known.includes(h))) {
+    const optCols = head.map((h, i) => (/^(option|opt|选项)?\s*[a-h1-8]$/.test(h) ? i : -1)).filter(i => i >= 0);
+    for (const r of rows.slice(1)) {
+      const o = {}; head.forEach((h, i) => { if (!optCols.includes(i)) o[h] = r[i]; });
+      if (optCols.length) o.options = optCols.map(i => r[i]).filter(x => x);
+      const c = normalizeCard(o); if (!c) errors.push("缺少题目"); else if (c.error) errors.push(c.error); else cards.push(c);
+    }
+    return { cards, errors };
+  }
+  for (const r of rows) {
+    if (r.length <= 3) { cards.push({ type: "flash", q: r[0], a: r[1] || "", note: r[2] || "" }); continue; }
+    // 题目, 选项..., 答案, [解析]
+    let ansPos = r.length - 1, note = "";
+    const looksAns = s => /^[A-Ha-h1-8①-⑥]$/.test(s);
+    if (!looksAns(r[ansPos]) && looksAns(r[ansPos - 1])) { note = r[ansPos]; ansPos--; }
+    const options = r.slice(1, ansPos).filter(x => x);
+    const answer = answerIndex(r[ansPos], options);
+    if (answer < 0) errors.push(`「${r[0].slice(0, 20)}」的答案无法识别`); else cards.push({ type: "choice", q: r[0], options, answer, note });
+  }
+  return { cards, errors };
+}
+function addCards(deckId, cards) {
+  const start = cardsOf(deckId).length;
+  putMany(cards.map((c, i) => ({ kind: "card", id: uid(), data: { ...c, deckId, order: start + i } })));
+}
+
+// ---------- views ----------
+const view = () => $("#view");
+function setBar(title, backHref) {
+  $("#title").textContent = title;
+  const b = $("#back"); b.style.visibility = backHref ? "visible" : "hidden"; b.onclick = () => { location.hash = backHref; };
+}
+function setTab(t) { document.querySelectorAll("#tabs a").forEach(a => a.classList.toggle("on", a.dataset.tab === t)); }
+
+function homeView() {
+  setBar("刷题卡片"); setTab("home");
+  const decks = all("deck").sort((a, b) => (a.data.order ?? 0) - (b.data.order ?? 0) || a.updated_at - b.updated_at);
+  view().innerHTML = (decks.length ? decks.map(d => {
+    const s = deckStats(d.id);
+    return `<a class="card deck" href="#/deck/${d.id}"><h3>${esc(d.data.name)}</h3>
+      <div class="stats"><span><b>${s.total}</b> 张</span><span class="due"><b>${s.due}</b> 待复习</span><span><b>${s.fresh}</b> 未学</span><span class="bad"><b>${s.book}</b> 错题</span></div></a>`;
+  }).join("") : `<div class="empty">还没有 session，点下面新建一个</div>`) +
+    `<button id="new-deck" style="width:100%">＋ 新建 session</button>`;
+  $("#new-deck").onclick = () => { location.hash = "#/deck-edit/new"; };
+}
+
+function deckEditView(id) {
+  const deck = id === "new" ? null : get(id);
+  const d = deck?.data || { name: "", subject: "", newPerDay: 20, sessionSize: 20 };
+  setBar(deck ? "编辑 session" : "新建 session", deck ? `#/deck/${id}` : "#/"); setTab("home");
+  view().innerHTML = `<div class="card">
+    <label>名称</label><input id="f-name" value="${esc(d.name)}" placeholder="例如：N1 文法">
+    <label>科目说明（给 AI 看，让解析更准确）</label><input id="f-subject" value="${esc(d.subject || "")}" placeholder="例如：日语 JLPT N1 文法">
+    <div class="row"><div><label>每次刷题数量</label><input id="f-size" type="number" min="1" value="${d.sessionSize || 20}"></div>
+    <div><label>每天新题上限</label><input id="f-new" type="number" min="0" value="${d.newPerDay ?? 20}"></div></div>
+    </div>
+    <button id="save" style="width:100%">保存</button>
+    ${deck ? `<div style="height:10px"></div><button id="del" class="danger" style="width:100%">删除这个 session（含所有卡片）</button>` : ""}`;
+  $("#save").onclick = () => {
+    const name = $("#f-name").value.trim(); if (!name) return toast("请填写名称");
+    const data = { ...d, name, subject: $("#f-subject").value.trim(), sessionSize: Math.max(1, +$("#f-size").value || 20), newPerDay: Math.max(0, +$("#f-new").value || 0) };
+    const nid = deck ? id : uid(); if (!deck) data.order = all("deck").length;
+    put("deck", nid, data); location.hash = `#/deck/${nid}`;
+  };
+  if (deck) $("#del").onclick = () => {
+    if (!confirm(`确定删除「${d.name}」和里面的所有卡片吗？`)) return;
+    const cs = cardsOf(id).map(c => c.id);
+    remove([id, ...cs, ...cs.map(c => "p_" + c).filter(p => items.has(p))]); location.hash = "#/";
+  };
+}
+
+function deckView(id) {
+  const deck = get(id); if (!deck) { location.hash = "#/"; return; }
+  setBar(deck.data.name, "#/"); setTab("home");
+  const s = deckStats(id); const cards = cardsOf(id);
+  const canStudy = buildQueue(id, "learn").length;
+  view().innerHTML = `
+    <div class="card"><div class="stats" style="font-size:15px"><span><b>${s.total}</b> 张</span><span class="due"><b>${s.due}</b> 待复习</span><span><b>${s.fresh}</b> 未学</span><span class="bad"><b>${s.book}</b> 错题</span></div>
+    <div class="muted" style="margin-top:4px">今天已学新题 ${s.newToday} / ${deck.data.newPerDay ?? 20}</div></div>
+    <button id="go" style="width:100%;font-size:18px" ${canStudy ? "" : "disabled"}>${canStudy ? `开始刷题（${canStudy} 题）` : "今天的任务完成了 🎉"}</button>
+    <div class="row" style="margin-top:8px">
+      <button id="go-wrong" class="secondary" ${s.book ? "" : "disabled"}>练错题（${s.book}）</button>
+      <button id="go-rand" class="secondary" ${s.total ? "" : "disabled"}>随机练习</button>
+    </div>
+    <div class="section-title">卡片</div>
+    <div class="row"><a class="btn secondary" href="#/card/${id}/new">＋ 添加</a><a class="btn secondary" href="#/import/${id}">批量导入</a><a class="btn secondary" href="#/deck-edit/${id}">设置</a></div>
+    <div style="height:10px"></div>
+    ${cards.length > 8 ? `<input id="search" placeholder="搜索卡片…" style="margin-bottom:8px">` : ""}
+    <div class="card" id="clist">${cards.length ? "" : `<div class="empty">还没有卡片。可以手动添加，或者批量导入题库。</div>`}</div>`;
+  const renderList = (f = "") => {
+    if (!cards.length) return;
+    const shown = cards.filter(c => !f || (c.data.q + (c.data.a || "") + (c.data.options || []).join("")).includes(f));
+    $("#clist").innerHTML = shown.slice(0, 300).map(c => {
+      const p = progOf(c.id);
+      return `<a class="list-item" href="#/card/${id}/${c.id}" style="color:inherit;text-decoration:none"><span class="grow">${esc(c.data.q.replace(/\s+/g, " "))}</span>${p?.inBook ? '<span class="tag bad">错题</span>' : ""}<span class="tag">${c.data.type === "choice" ? "选择" : "卡片"}</span></a>`;
+    }).join("") + (shown.length > 300 ? `<div class="muted">只显示前 300 张，请用搜索</div>` : "");
+  };
+  renderList();
+  $("#search")?.addEventListener("input", e => renderList(e.target.value.trim()));
+  $("#go").onclick = () => startStudy(id, "learn");
+  $("#go-wrong").onclick = () => startStudy(id, "wrong");
+  $("#go-rand").onclick = () => startStudy(id, "random");
+}
+
+function cardEditView(deckId, cardId) {
+  const card = cardId === "new" ? null : get(cardId);
+  const d = card?.data || { type: "choice", q: "", options: ["", "", "", ""], answer: 0, a: "", note: "" };
+  setBar(card ? "编辑卡片" : "添加卡片", `#/deck/${deckId}`); setTab("home");
+  let type = d.type;
+  const render = () => {
+    view().innerHTML = `<div class="card">
+      <div class="row"><button class="small ${type === "choice" ? "" : "ghost"}" data-t="choice">选择题</button><button class="small ${type === "flash" ? "" : "ghost"}" data-t="flash">单词卡（正反面）</button></div>
+      <label>${type === "choice" ? "题目（用 ＿词＿ 表示下划线）" : "正面（单词）"}</label><textarea id="f-q" style="min-height:90px;font-family:inherit;font-size:16px">${esc(d.q)}</textarea>
+      ${type === "choice" ? `<label>选项（点圆圈选正确答案）</label>${(d.options || ["", "", "", ""]).map((o, i) => `
+        <div class="row" style="align-items:center;margin-bottom:6px"><input type="radio" name="ans" value="${i}" ${d.answer === i ? "checked" : ""} style="flex:0 0 22px;width:22px;height:22px">
+        <input class="f-opt" value="${esc(o)}" placeholder="选项 ${i + 1}" style="flex:1"></div>`).join("")}
+        <button class="small ghost" id="add-opt">＋ 加一个选项</button>`
+        : `<label>背面（意思）</label><textarea id="f-a" style="min-height:90px;font-family:inherit;font-size:16px">${esc(d.a || "")}</textarea>`}
+      <label>解析 / 备注（可不填）</label><textarea id="f-note" style="min-height:70px;font-family:inherit;font-size:15px">${esc(d.note || "")}</textarea>
+      </div>
+      <button id="save" style="width:100%">保存</button>
+      ${card ? `<div style="height:10px"></div><div class="row"><button id="reset" class="ghost">重置学习进度</button><button id="del" class="danger">删除卡片</button></div>` : ""}`;
+    view().querySelectorAll("[data-t]").forEach(b => b.onclick = () => { collect(); type = b.dataset.t; render(); });
+    $("#add-opt")?.addEventListener("click", () => { collect(); d.options.push(""); render(); });
+    $("#save").onclick = save;
+    if (card) {
+      $("#del").onclick = () => { if (confirm("删除这张卡片？")) { remove([cardId, "p_" + cardId].filter(x => items.has(x))); location.hash = `#/deck/${deckId}`; } };
+      $("#reset").onclick = () => { if (items.has("p_" + cardId)) remove(["p_" + cardId]); toast("已重置"); };
+    }
+  };
+  const collect = () => {
+    d.q = $("#f-q").value; d.note = $("#f-note").value;
+    if (type === "choice") { d.options = [...view().querySelectorAll(".f-opt")].map(x => x.value); d.answer = +(view().querySelector("[name=ans]:checked")?.value ?? 0); }
+    else d.a = $("#f-a").value;
+  };
+  const save = () => {
+    collect(); if (!d.q.trim()) return toast("请填写题目");
+    let data;
+    if (type === "choice") {
+      const pairs = d.options.map((o, i) => [o.trim(), i]).filter(p => p[0]);
+      if (pairs.length < 2) return toast("至少需要两个选项");
+      const answer = pairs.findIndex(p => p[1] === d.answer); if (answer < 0) return toast("请选一个正确答案");
+      data = { type, q: d.q.trim(), options: pairs.map(p => p[0]), answer, note: d.note.trim() };
+    } else data = { type, q: d.q.trim(), a: d.a.trim(), note: d.note.trim() };
+    data.deckId = deckId;
+    if (card) { data.order = card.data.order; if (card.data.q === data.q && JSON.stringify(card.data.options) === JSON.stringify(data.options) && card.data.a === data.a) data.ai = card.data.ai; put("card", cardId, data); }
+    else { data.order = cardsOf(deckId).length; put("card", uid(), data); }
+    toast("已保存");
+    if (card) location.hash = `#/deck/${deckId}`; else { d.q = ""; d.options = ["", "", "", ""]; d.a = ""; d.note = ""; render(); $("#f-q").focus(); }
+  };
+  render();
+}
+
+const AI_PROMPT = `请把下面的题目整理成 JSON 数组，每道选择题格式：
+{"q": "题目（下划线部分用＿词＿标出）", "options": ["选项1","选项2","选项3","选项4"], "answer": 正确选项的序号(1-4), "note": "解析(可选)"}
+每个单词卡格式：{"q": "单词", "a": "读音 + 意思"}
+只输出 JSON，不要其他文字。`;
+
+function importView(deckId) {
+  const deck = get(deckId); if (!deck) { location.hash = "#/"; return; }
+  setBar("批量导入", `#/deck/${deckId}`); setTab("home");
+  view().innerHTML = `<div class="card">
+    <div class="muted">把题目粘贴到下面（支持 JSON、CSV、或从 Excel / Numbers 复制的表格），也可以选择文件。</div>
+    <textarea id="f-text" placeholder="例：\nmeticulous,一丝不苟的\nubiquitous,无处不在的"></textarea>
+    <div class="row" style="margin-top:8px"><label class="btn secondary" style="margin:0">选择文件<input id="f-file" type="file" accept=".json,.csv,.tsv,.txt" hidden></label><button id="preview" class="secondary">预览</button></div>
+    <div id="result" class="muted" style="margin-top:10px"></div>
+    </div>
+    <button id="do" style="width:100%" disabled>导入</button>
+    <details class="card" style="margin-top:12px"><summary>支持的格式</summary>
+    <p class="muted">① 单词卡：每行「单词,意思」</p><pre class="fmt">설레다,心动，激动\n아쉽다,可惜，遗憾</pre>
+    <p class="muted">② 选择题：每行「题目,选项1,选项2,选项3,选项4,答案,解析(可选)」，答案写 1-4 或 A-D</p><pre class="fmt">彼の態度は反省している（　）開き直っている,どころか,ばかりか,にもまして,とあって,1</pre>
+    <p class="muted">③ JSON（适合让 AI 帮你整理题库）</p><pre class="fmt">[{"q":"…","options":["…","…","…","…"],"answer":1,"note":"…"}]</pre>
+    <p class="muted">让 AI 帮你把 PDF/照片里的题转成可导入的格式，可以复制这段话给它：</p>
+    <button id="copy-prompt" class="small secondary">复制给 AI 的说明</button>
+    </details>`;
+  let parsed = null;
+  const doPreview = () => {
+    try {
+      parsed = parseImport($("#f-text").value);
+      const ch = parsed.cards.filter(c => c.type === "choice").length;
+      $("#result").innerHTML = `识别到 <b>${parsed.cards.length}</b> 张（选择题 ${ch}，单词卡 ${parsed.cards.length - ch}）` +
+        (parsed.errors.length ? `<br><span style="color:var(--bad)">${parsed.errors.length} 条有问题：${esc(parsed.errors.slice(0, 3).join("；"))}</span>` : "") +
+        (parsed.cards[0] ? `<br>第一张：${esc(parsed.cards[0].q.slice(0, 40))}` : "");
+      $("#do").disabled = !parsed.cards.length;
+    } catch (e) { parsed = null; $("#do").disabled = true; $("#result").innerHTML = `<span style="color:var(--bad)">格式无法识别：${esc(e.message)}</span>`; }
+  };
+  $("#preview").onclick = doPreview;
+  $("#f-text").addEventListener("input", () => { clearTimeout(doPreview._t); doPreview._t = setTimeout(doPreview, 400); });
+  $("#f-file").onchange = async e => { const f = e.target.files[0]; if (!f) return; $("#f-text").value = await f.text(); doPreview(); };
+  $("#do").onclick = () => { if (!parsed?.cards.length) return; addCards(deckId, parsed.cards); toast(`已导入 ${parsed.cards.length} 张`); location.hash = `#/deck/${deckId}`; };
+  $("#copy-prompt").onclick = async () => { try { await navigator.clipboard.writeText(AI_PROMPT); toast("已复制"); } catch { prompt("复制下面的文字", AI_PROMPT); } };
+}
+
+// ---------- study ----------
+let S = null; // { deckId, mode, queue, idx, right, wrong, again:Set }
+function startStudy(deckId, mode) {
+  const queue = buildQueue(deckId, mode);
+  if (!queue.length) return toast("没有需要刷的题");
+  S = { deckId, mode, queue, idx: 0, right: 0, wrong: 0, total: queue.length, back: deckId ? `#/deck/${deckId}` : "#/wrong" };
+  location.hash = "#/study";
+}
+function studyView() {
+  if (!S) { location.hash = "#/"; return; }
+  document.body.classList.add("studying");
+  setBar(S.mode === "wrong" ? "错题练习" : S.mode === "random" ? "随机练习" : (get(S.deckId)?.data.name || "刷题"), S.back);
+  if (S.idx >= S.queue.length) return studyDone();
+  const card = get(S.queue[S.idx]); if (!card) { S.idx++; return studyView(); }
+  const d = card.data; const p = progOf(card.id);
+  const pct = Math.min(100, Math.round((S.idx / S.queue.length) * 100));
+  const head = `<div class="progress"><div style="width:${pct}%"></div></div>
+    <div class="q-meta"><span>${S.idx + 1} / ${S.queue.length}</span><span>${p?.inBook ? '<span class="tag bad">错题本</span> ' : ""}${!p ? '<span class="tag">新</span>' : ""} ✓${S.right} ✗${S.wrong}</span></div>`;
+  let answered = false, pick = null;
+  const order = d.type === "choice" ? (settings.shuffleOptions ? shuffle(d.options.map((_, i) => i)) : d.options.map((_, i) => i)) : [];
+
+  const renderChoice = () => {
+    view().innerHTML = `${head}<div class="card"><div class="q-text">${richQ(d.q)}</div>
+      <div class="opts">${order.map((oi, k) => `<button class="opt" data-i="${oi}"><span class="n">${k + 1}</span><span>${esc(d.options[oi])}</span></button>`).join("")}</div>
+      <div id="after"></div></div><div class="study-actions" id="actions"></div>`;
+    view().querySelectorAll(".opt").forEach(b => b.onclick = () => {
+      if (answered) return; answered = true; pick = +b.dataset.i;
+      const ok = pick === d.answer;
+      view().querySelectorAll(".opt").forEach(x => { const i = +x.dataset.i; if (i === d.answer) x.classList.add("right"); else if (i === pick) x.classList.add("wrong"); });
+      record(card, ok);
+      $("#after").innerHTML = `<div class="verdict ${ok ? "ok" : "bad"}">${ok ? "✓ 正确" : "✗ 错了，已加入错题本"}</div>${d.note ? `<div class="note">${esc(d.note)}</div>` : ""}<div class="ai" id="ai"></div>`;
+      showActions(ok);
+      setTimeout(() => $("#after").scrollIntoView({ behavior: "smooth", block: "center" }), 50);
+    });
+  };
+  const renderFlash = () => {
+    view().innerHTML = `${head}<div class="card"><div class="flash-front">${richQ(d.q)}</div><div id="after"></div></div><div class="study-actions" id="actions"><button id="flip" style="width:100%">显示答案</button></div>`;
+    $("#flip").onclick = () => {
+      $("#after").innerHTML = `<div class="flash-back">${esc(d.a || "")}</div>${d.note ? `<div class="note">${esc(d.note)}</div>` : ""}<div class="ai" id="ai"></div>`;
+      $("#actions").innerHTML = `<div class="row"><button id="forgot" class="danger">✗ 不记得</button><button id="knew" style="background:var(--ok)">✓ 记得</button></div><div class="row"><button id="ai-btn" class="secondary">查看解析</button></div>`;
+      $("#ai-btn").onclick = () => runAI(card, null);
+      $("#forgot").onclick = () => { record(card, false); next(); };
+      $("#knew").onclick = () => { record(card, true); next(); };
+    };
+  };
+  const showActions = () => {
+    $("#actions").innerHTML = `<div class="row"><button id="ai-btn" class="secondary">查看解析</button><button id="next">下一题 →</button></div>`;
+    $("#ai-btn").onclick = () => runAI(card, pick);
+    $("#next").onclick = next;
+  };
+  const next = () => { S.idx++; window.scrollTo(0, 0); studyView(); };
+  if (d.type === "choice") renderChoice(); else renderFlash();
+}
+function record(card, ok) {
+  grade(card, ok);
+  if (ok) S.right++; else {
+    S.wrong++;
+    // 本轮内过几题再出一次
+    const pos = Math.min(S.queue.length, S.idx + 4);
+    if (S.queue.indexOf(card.id, S.idx + 1) < 0) S.queue.splice(pos, 0, card.id);
+  }
+}
+async function runAI(card, pick) {
+  const box = $("#ai"); const btn = $("#ai-btn");
+  const cached = get(card.id)?.data.ai;
+  if (cached?.text) {
+    box.innerHTML = md(cached.text) + `<div class="muted" style="margin-top:6px"><a href="#" id="regen">重新生成</a></div>`;
+    btn.style.display = "none";
+    $("#regen").onclick = e => { e.preventDefault(); const c = get(card.id); const nd = { ...c.data }; delete nd.ai; put("card", card.id, nd); runAI(card, pick); };
+    return;
+  }
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> AI 正在解析…';
+  let acc = ""; box.innerHTML = "";
+  try {
+    const res = await explain(card, pick, t => { acc += t; box.innerHTML = md(acc); });
+    const c = get(card.id); if (c) put("card", card.id, { ...c.data, ai: res });
+    box.innerHTML = md(res.text); btn.style.display = "none";
+  } catch (e) {
+    console.error(e);
+    let msg = e?.message || String(e);
+    if (e?.status === 401) msg = "API Key 不正确，请到设置里检查";
+    else if (e?.status === 429) msg = "请求太频繁或额度不足，稍后再试";
+    else if (/credit|billing|balance/i.test(msg)) msg = "Anthropic 账户余额不足，请先充值";
+    box.innerHTML = `<div class="note" style="color:var(--bad)">解析失败：${esc(msg)}</div>`;
+    btn.disabled = false; btn.textContent = "重试解析";
+  }
+}
+function studyDone() {
+  const total = S.right + S.wrong; const rate = total ? Math.round((S.right / total) * 100) : 0;
+  view().innerHTML = `<div class="done-big">🎉</div><h2 style="text-align:center;margin:8px 0">这一轮完成了</h2>
+    <div class="card" style="text-align:center"><div class="stats" style="justify-content:center;font-size:16px"><span>答对 <b>${S.right}</b></span><span class="bad">答错 <b>${S.wrong}</b></span><span>正确率 <b>${rate}%</b></span></div></div>
+    <button id="done" style="width:100%">返回</button>`;
+  $("#done").onclick = () => { location.hash = S.back; };
+  syncNow();
+}
+
+function wrongView() {
+  setBar("错题本"); setTab("wrong");
+  const book = all("prog").filter(p => p.data.inBook && get(p.data.cardId));
+  const byDeck = {};
+  for (const p of book) (byDeck[p.data.deckId] ||= []).push(p);
+  view().innerHTML = book.length ? `<button id="all" style="width:100%">练习全部错题（${book.length}）</button>
+    <div class="muted" style="margin:8px 4px">答错的题会自动放进来，之后连续答对 2 次会自动移出。</div>` +
+    Object.entries(byDeck).map(([did, ps]) => `<div class="section-title">${esc(get(did)?.data.name || "已删除")}</div><div class="card">
+      <button class="small secondary" data-deck="${did}" style="width:100%;margin-bottom:6px">只练这个（${ps.length}）</button>
+      ${ps.sort((a, b) => b.data.wrong - a.data.wrong).map(p => { const c = get(p.data.cardId); return `<div class="list-item"><a class="grow" href="#/card/${did}/${c.id}" style="color:inherit;text-decoration:none">${esc(c.data.q.replace(/\s+/g, " "))}</a><span class="tag bad">错${p.data.wrong}次</span><button class="small ghost" data-out="${p.id}">移出</button></div>`; }).join("")}</div>`).join("")
+    : `<div class="empty">📕<br>错题本是空的<br>刷题时答错的题会自动放进来</div>`;
+  $("#all")?.addEventListener("click", () => startStudy(null, "wrong"));
+  view().querySelectorAll("[data-deck]").forEach(b => b.onclick = () => startStudy(b.dataset.deck, "wrong"));
+  view().querySelectorAll("[data-out]").forEach(b => b.onclick = () => { const p = get(b.dataset.out); put("prog", p.id, { ...p.data, inBook: false }); wrongView(); });
+}
+
+function settingsView() {
+  setBar("设置"); setTab("settings");
+  const cloudReady = !!(sbUrl() && sbKey());
+  view().innerHTML = `
+    <div class="section-title">云同步</div>
+    <div class="card" id="cloud">
+      ${!cloudReady ? `<div class="muted">还没有配置云同步，现在数据只保存在这台设备上。</div>`
+      : sbUser ? `<div>已登录：<b>${esc(sbUser.email)}</b></div><div class="row" style="margin-top:10px"><button id="sync">立即同步</button><button id="logout" class="ghost">退出登录</button></div>`
+      : `<div class="muted">登录后，手机和电脑上的题库、进度、错题本会自动同步。</div>
+        <label>邮箱</label><input id="em" type="email" autocomplete="username">
+        <label>密码（至少 6 位）</label><input id="pw" type="password" autocomplete="current-password">
+        <div class="row" style="margin-top:10px"><button id="login">登录</button><button id="signup" class="secondary">注册新账号</button></div>`}
+      <details style="margin-top:12px"><summary>高级：Supabase 连接信息</summary>
+        <label>Project URL</label><input id="sb-url" value="${esc(settings.supabaseUrl)}" placeholder="${esc(window.APP_CONFIG?.SUPABASE_URL || "https://xxxx.supabase.co")}">
+        <label>anon / publishable key</label><input id="sb-key" value="${esc(settings.supabaseKey)}" placeholder="${window.APP_CONFIG?.SUPABASE_ANON_KEY ? "（已内置）" : ""}">
+        <button id="sb-save" class="small secondary" style="margin-top:8px">保存连接信息</button>
+      </details>
+    </div>
+    <div class="section-title">AI 解析</div>
+    <div class="card">
+      <label>Anthropic API Key（只保存在这台设备上）</label><input id="key" type="password" value="${esc(settings.apiKey)}" placeholder="sk-ant-…">
+      <label>模型</label><select id="model">
+        ${[["claude-opus-5-5", "Claude Opus 5.5（最准确）"], ["claude-sonnet-5-5", "Claude Sonnet 5.5（便宜一半）"], ["claude-haiku-5-5", "Claude Haiku 5.5（最便宜最快）"]].map(([v, t]) => `<option value="${v}" ${settings.model === v ? "selected" : ""}>${t}</option>`).join("")}
+      </select>
+      <label>思考深度</label><select id="effort">
+        ${[["low", "快速（推荐）"], ["medium", "标准"], ["high", "深入（更慢）"]].map(([v, t]) => `<option value="${v}" ${settings.effort === v ? "selected" : ""}>${t}</option>`).join("")}
+      </select>
+      <div class="muted" style="margin-top:8px">同一道题的解析会被保存，第二次查看不再花钱。</div>
+      <button id="key-save" style="width:100%;margin-top:10px">保存</button>
+    </div>
+    <div class="section-title">刷题</div>
+    <div class="card"><label style="display:flex;gap:10px;align-items:center;color:var(--text);margin:0"><input id="shuf" type="checkbox" style="width:22px;height:22px" ${settings.shuffleOptions ? "checked" : ""}> 打乱选择题选项顺序</label></div>
+    <div class="section-title">备份</div>
+    <div class="card"><div class="row"><button id="export" class="secondary">导出备份</button><label class="btn secondary" style="margin:0">恢复备份<input id="restore" type="file" accept=".json" hidden></label></div></div>
+    <div class="muted" style="text-align:center;margin-top:16px">刷题卡片 v1</div>`;
+  $("#sb-save").onclick = async () => { settings.supabaseUrl = $("#sb-url").value.trim(); settings.supabaseKey = $("#sb-key").value.trim(); saveSettings(); await initSupabase(); settingsView(); toast("已保存"); };
+  $("#key-save").onclick = () => { settings.apiKey = $("#key").value.trim(); settings.model = $("#model").value; settings.effort = $("#effort").value; saveSettings(); toast("已保存"); };
+  $("#shuf").onchange = e => { settings.shuffleOptions = e.target.checked; saveSettings(); };
+  const auth = async (kind) => {
+    const email = $("#em").value.trim(), password = $("#pw").value;
+    if (!email || password.length < 6) return toast("请填写邮箱和至少 6 位密码");
+    const fn = kind === "signup" ? sb.auth.signUp({ email, password }) : sb.auth.signInWithPassword({ email, password });
+    const { data, error } = await fn;
+    if (error) return toast((kind === "signup" ? "注册失败：" : "登录失败：") + error.message, 4000);
+    if (!data.session) return toast("请到邮箱点确认链接，然后回来登录", 5000);
+    sbUser = data.session.user; toast("登录成功，正在同步…"); await syncNow(); settingsView();
+  };
+  $("#login")?.addEventListener("click", () => auth("login"));
+  $("#signup")?.addEventListener("click", () => auth("signup"));
+  $("#sync")?.addEventListener("click", () => syncNow(true));
+  $("#logout")?.addEventListener("click", async () => { await sb.auth.signOut(); sbUser = null; setDot(""); settingsView(); });
+  $("#export").onclick = () => {
+    const blob = new Blob([JSON.stringify([...items.values()].filter(live), null, 1)], { type: "application/json" });
+    const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `刷题备份-${new Date().toISOString().slice(0, 10)}.json`; a.click();
+  };
+  $("#restore").onchange = async e => {
+    const f = e.target.files[0]; if (!f) return;
+    try { const list = JSON.parse(await f.text()); putMany(list.filter(x => x.id && x.kind).map(x => ({ kind: x.kind, id: x.id, data: x.data }))); toast(`已恢复 ${list.length} 条`); }
+    catch (err) { toast("文件无法识别"); }
+  };
+}
+
+// ---------- router ----------
+function route() {
+  const h = location.hash.replace(/^#\/?/, "").split("/");
+  if (h[0] !== "study") document.body.classList.remove("studying");
+  window.scrollTo(0, 0);
+  switch (h[0]) {
+    case "deck": return deckView(h[1]);
+    case "deck-edit": return deckEditView(h[1]);
+    case "card": return cardEditView(h[1], h[2]);
+    case "import": return importView(h[1]);
+    case "study": return studyView();
+    case "wrong": return wrongView();
+    case "settings": return settingsView();
+    default: return homeView();
+  }
+}
+
+async function seed() {
+  const list = [];
+  SAMPLE_DECKS.forEach((d, di) => {
+    if (items.has(d.id)) return;
+    list.push({ kind: "deck", id: d.id, data: { name: d.name, subject: d.subject, newPerDay: 20, sessionSize: 20, order: di } });
+    d.cards.forEach((c, i) => list.push({ kind: "card", id: `${d.id}-${i}`, data: { ...c, note: c.note || "", deckId: d.id, order: i } }));
+  });
+  putMany(list);
+}
+
+async function main() {
+  idb = await openDB();
+  for (const it of await idbAll()) items.set(it.id, it);
+  await initSupabase();
+  if (sb && sbUser) await syncNow();
+  if (![...items.values()].some(it => it.kind === "deck")) await seed();
+  window.addEventListener("hashchange", route);
+  route();
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") syncNow(); else scheduleSync(500); });
+  if ("serviceWorker" in navigator && location.protocol === "https:") navigator.serviceWorker.register("sw.js").catch(() => {});
+}
+main().catch(e => { console.error(e); view().innerHTML = `<div class="empty">启动失败：${esc(e.message)}</div>`; });
