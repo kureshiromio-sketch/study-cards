@@ -916,7 +916,7 @@ function settingsView() {
     <div class="card" id="ai-card"></div>
     <div class="section-title">AI 提示词</div>
     <div class="card" id="prompt-card"></div>
-    <div class="section-title">音效</div><div class="card"><label style="display:flex;justify-content:space-between">音效音量 <span id="sound-volume-value">${settings.soundVolume ?? 30}%</span></label><input id="sound-volume" type="range" min="0" max="100" step="1" value="${settings.soundVolume ?? 30}" style="width:100%"><div class="muted">30% 为当前音量，设为 0 可静音。</div></div><div class="section-title">刷题</div>
+    <div class="section-title">音效</div><div class="card"><label style="display:flex;justify-content:space-between">音效音量 <span id="sound-volume-value">${settings.soundVolume ?? 30}%</span></label><input id="sound-volume" type="range" min="0" max="100" step="1" value="${settings.soundVolume ?? 30}" style="width:100%"></div><div class="section-title">刷题</div>
     <div class="card"><label style="display:flex;gap:10px;align-items:center;color:var(--text);margin:0"><input id="shuf" type="checkbox" style="width:22px;height:22px" ${settings.shuffleOptions ? "checked" : ""}> 打乱选择题选项顺序</label></div>
     <div class="section-title">备份</div>
     <div class="card"><div class="row"><button id="export" class="secondary">导出备份</button><label class="btn secondary" style="margin:0">恢复备份<input id="restore" type="file" accept=".json" hidden></label></div></div>
