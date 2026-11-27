@@ -24,7 +24,7 @@ function playSound(kind) {
     const sounds = {
       click: [[720, 0, 0.04, 0.08]],
       correct: [[660, 0.05, 0.11, 0.12], [880, 0.18, 0.15, 0.12]],
-      wrong: [[220, 0.05, 0.13, 0.11], [165, 0.20, 0.17, 0.11]],
+      wrong: [[220, 0.05, 0.13, 0.11], [165, 0.20, 0.17, 0.11]], flip: [[520, 0, 0.06, 0.07]], navigate: [[440, 0, 0.045, 0.045]], done: [[660, 0, 0.1, 0.08], [880, 0.12, 0.16, 0.08], [1040, 0.32, 0.22, 0.08]],
     };
     const now = audioCtx.currentTime;
     for (const [frequency, delay, duration, volume] of sounds[kind] || []) {
@@ -33,7 +33,7 @@ function playSound(kind) {
       oscillator.type = "sine";
       oscillator.frequency.setValueAtTime(frequency, now + delay);
       gain.gain.setValueAtTime(0.0001, now + delay);
-      gain.gain.exponentialRampToValueAtTime(volume, now + delay + 0.01);
+      gain.gain.exponentialRampToValueAtTime(volume * (settings.soundVolume ?? 30) / 30, now + delay + 0.01);
       gain.gain.exponentialRampToValueAtTime(0.0001, now + delay + duration);
       oscillator.connect(gain);
       gain.connect(audioCtx.destination);
@@ -76,7 +76,7 @@ function md(s) {
 
 // ---------- settings (per device) ----------
 const SETTINGS_KEY = "sc_settings";
-const defaults = { provider: "claude", keys: {}, models: {}, customBase: "", apiKey: "", model: "claude-opus-5-5", effort: "low", supabaseUrl: "", supabaseKey: "", shuffleOptions: true };
+const defaults = { provider: "claude", keys: {}, models: {}, customBase: "", apiKey: "", model: "claude-opus-5-5", effort: "low", supabaseUrl: "", supabaseKey: "", shuffleOptions: true, soundVolume: 30 };
 let settings = { ...defaults };
 try { Object.assign(settings, JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}")); } catch {}
 // 旧版本只存了 Claude 的 key
@@ -702,7 +702,7 @@ function shiftAns(s, at) {
   const n = {}; for (const [k, v] of Object.entries(s.ans)) n[+k >= at ? +k + 1 : k] = v; s.ans = n;
 }
 function go(step) {
-  const to = S.idx + step;
+  playSound("navigate"); const to = S.idx + step;
   if (to < 0) return toast("已经是第一题");
   if (to > S.queue.length) return;
   S.idx = to; saveS();
@@ -781,7 +781,7 @@ function studyView() {
     view().innerHTML = `${head}<div class="card"><div class="flash-front">${richQ(d.q)}</div><div id="after"></div></div><div class="study-actions" id="actions"><button id="flip" style="width:100%">显示答案</button>${navRow.replace("下一题 →", "跳过 →")}</div>`;
     bindNav();
     if (rec) return flipped();
-    $("#flip").onclick = flipped;
+    $("#flip").onclick = () => { playSound("flip"); flipped(); };
   };
   if (d.type === "choice") renderChoice(); else renderFlash();
 }
@@ -865,7 +865,7 @@ function renderChat(card, pick) {
   box.querySelectorAll(".chip").forEach(b => b.onclick = () => send(QUICK_ASKS[card.data.type === "choice" ? "choice" : "flash"][+b.dataset.q]));
   $("#ask").addEventListener("keydown", e => { if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); send(); } });
 }
-function studyDone() {
+function studyDone() { playSound("done");
   const vals = Object.values(S.ans); const right = vals.filter(x => x.ok).length, wrong = vals.length - right;
   const rate = vals.length ? Math.round((right / vals.length) * 100) : 0;
   const skipped = S.queue.length - vals.length;
@@ -916,14 +916,14 @@ function settingsView() {
     <div class="card" id="ai-card"></div>
     <div class="section-title">AI 提示词</div>
     <div class="card" id="prompt-card"></div>
-    <div class="section-title">刷题</div>
+    <div class="section-title">音效</div><div class="card"><label style="display:flex;justify-content:space-between">音效音量 <span id="sound-volume-value">${settings.soundVolume ?? 30}%</span></label><input id="sound-volume" type="range" min="0" max="100" step="1" value="${settings.soundVolume ?? 30}" style="width:100%"><div class="muted">30% 为当前音量，设为 0 可静音。</div></div><div class="section-title">刷题</div>
     <div class="card"><label style="display:flex;gap:10px;align-items:center;color:var(--text);margin:0"><input id="shuf" type="checkbox" style="width:22px;height:22px" ${settings.shuffleOptions ? "checked" : ""}> 打乱选择题选项顺序</label></div>
     <div class="section-title">备份</div>
     <div class="card"><div class="row"><button id="export" class="secondary">导出备份</button><label class="btn secondary" style="margin:0">恢复备份<input id="restore" type="file" accept=".json" hidden></label></div></div>
     <div class="muted" style="text-align:center;margin-top:16px">刷题卡片 v1</div>`;
   $("#sb-save").onclick = async () => { settings.supabaseUrl = $("#sb-url").value.trim(); settings.supabaseKey = $("#sb-key").value.trim(); saveSettings(); await initSupabase(); settingsView(); toast("已保存"); };
   renderAISettings(); renderPromptSettings();
-  $("#shuf").onchange = e => { settings.shuffleOptions = e.target.checked; saveSettings(); };
+  $("#shuf").onchange = e => { settings.shuffleOptions = e.target.checked; saveSettings(); }; $("#sound-volume").oninput = e => { settings.soundVolume = +e.target.value; $("#sound-volume-value").textContent = settings.soundVolume + "%"; saveSettings(); };
   const auth = async (kind) => {
     const email = $("#em").value.trim(), password = $("#pw").value;
     if (!email || password.length < 6) return toast("请填写邮箱和至少 6 位密码");
