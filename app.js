@@ -14,6 +14,34 @@ function toast(msg, ms = 2200) {
   const t = $("#toast"); t.textContent = msg; t.classList.add("show");
   clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove("show"), ms);
 }
+let audioCtx;
+function playSound(kind) {
+  try {
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContext) return;
+    audioCtx ||= new AudioContext();
+    if (audioCtx.state === "suspended") audioCtx.resume();
+    const sounds = {
+      click: [[720, 0, 0.04, 0.025]],
+      correct: [[660, 0.05, 0.11, 0.05], [880, 0.18, 0.15, 0.05]],
+      wrong: [[220, 0.05, 0.13, 0.045], [165, 0.20, 0.17, 0.045]],
+    };
+    const now = audioCtx.currentTime;
+    for (const [frequency, delay, duration, volume] of sounds[kind] || []) {
+      const oscillator = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      oscillator.type = "sine";
+      oscillator.frequency.setValueAtTime(frequency, now + delay);
+      gain.gain.setValueAtTime(0.0001, now + delay);
+      gain.gain.exponentialRampToValueAtTime(volume, now + delay + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + delay + duration);
+      oscillator.connect(gain);
+      gain.connect(audioCtx.destination);
+      oscillator.start(now + delay);
+      oscillator.stop(now + delay + duration + 0.01);
+    }
+  } catch {}
+}
 function shuffle(a) { a = a.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
 // ＿词＿ 或 <u>词</u> 显示为下划线
 function richQ(s) { return esc(s).replace(/＿([^＿\n]+)＿/g, '<span class="ul">$1</span>').replace(/&lt;u&gt;(.*?)&lt;\/u&gt;/g, '<span class="ul">$1</span>'); }
@@ -698,6 +726,7 @@ function studyView() {
   const navRow = `<div class="row"><button class="ghost" id="prev" ${pos === 0 ? "disabled" : ""}>← 上一题</button><button id="next">${S.idx === S.queue.length - 1 ? "完成" : "下一题 →"}</button></div>`;
 
   const answer = ok => {
+    playSound(ok ? "correct" : "wrong");
     grade(card, ok);
     S.ans[pos] = { pick: rec?.pick ?? null, ok, ...S.ans[pos] };
     if (!ok) { // 本轮内过几题再出一次
@@ -728,6 +757,7 @@ function studyView() {
     view().querySelectorAll(".opt").forEach(b => b.onclick = () => {
       if (S.ans[pos]) return;
       const pick = +b.dataset.i; S.ans[pos] = { pick };
+      playSound("click");
       answer(pick === d.answer); showChoiceResult(pick, true);
     });
   };
