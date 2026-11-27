@@ -85,7 +85,7 @@ const PROVIDERS = {
   claude: { name: "Claude（Anthropic）", keyHint: "sk-ant-…", keyUrl: "https://console.anthropic.com",
     models: [["claude-opus-5-5", "Claude Opus 5.5（最准确）"], ["claude-sonnet-5-5", "Claude Sonnet 5.5（便宜一半）"], ["claude-haiku-5-5", "Claude Haiku 5.5（最便宜最快）"]] },
   deepseek: { name: "DeepSeek", base: "https://api.deepseek.com/v1", keyHint: "sk-…", keyUrl: "https://platform.deepseek.com",
-    models: [["deepseek-chat", "deepseek-chat（快）"], ["deepseek-reasoner", "deepseek-reasoner（会先思考，慢一些）"], ["deepseek-flash", "deepseek-flash"], ["deepseek-v4-pro", "deepseek-v4-pro"]] },
+    models: [["deepseek-chat", "Flash（快速）"], ["deepseek-reasoner", "Flash（思考）"], ["deepseek-flash", "deepseek-flash"], ["deepseek-v4-pro", "deepseek-v4-pro"]] },
   qwen: { name: "通义千问（阿里云百炼）", base: "https://dashscope.aliyuncs.com/compatible-mode/v1", keyHint: "sk-…", keyUrl: "https://bailian.console.aliyun.com",
     models: [["qwen-plus", "qwen-plus（推荐）"], ["qwen-max", "qwen-max（最强）"], ["qwen-turbo", "qwen-turbo（最便宜）"]] },
   custom: { name: "其他（OpenAI 兼容接口）", keyHint: "API Key", models: [] },
@@ -346,10 +346,11 @@ async function explainOpenAICompat(prov, system, messages, onText) {
   const model = aiModel(); if (!model) throw new Error("请在设置里填写模型名称");
   let res;
   try {
+    const deepSeek = prov === "deepseek" ? deepSeekModel(model) : null;
     res = await fetch(base + "/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + aiKey() },
-      body: JSON.stringify({ model, stream: true, ...(prov === "deepseek" ? { stream_options: { include_usage: true } } : {}), max_tokens: 4000, messages: [{ role: "system", content: system }, ...messages] }),
+      body: JSON.stringify({ model, stream: true, ...(deepSeek ? { stream_options: { include_usage: true }, ...deepSeek } : {}), max_tokens: 4000, messages: [{ role: "system", content: system }, ...messages] }),
     });
   } catch (e) { throw new Error("连不上接口（网络问题，或这个服务不允许网页直接调用）"); }
   if (!res.ok) {
@@ -1004,10 +1005,21 @@ if (!Array.isArray(data.balance_infos)) throw new Error("服务商没有返回�
 return data.balance_infos.map(b => ({ currency: b.currency, amount: Number(b.total_balance) }));
 }
 
+function deepSeekModel(model) {
+  switch (model) {
+    case "deepseek-chat": return { model: "deepseek-flash", thinking: { type: "disabled" } };
+    case "deepseek-reasoner": return { model: "deepseek-flash", thinking: { type: "enabled" } };
+    case "deepseek-v4-flash":
+    case "deepseek-v4-flash-vision-exp": return { model: "deepseek-flash" };
+    default: return { model };
+  }
+}
+
 function estimateBalances(balances, provider, model, key, currency, cost) {
   // DeepSeek peak prices per million tokens. Assume no cache discount.
-  const modelRates = provider === "deepseek" && Object.hasOwn(DEEPSEEK_ESTIMATE_RATES, model)
-    ? DEEPSEEK_ESTIMATE_RATES[model] : null;
+  const pricedModel = provider === "deepseek" ? deepSeekModel(model).model : "";
+  const modelRates = Object.hasOwn(DEEPSEEK_ESTIMATE_RATES, pricedModel)
+    ? DEEPSEEK_ESTIMATE_RATES[pricedModel] : null;
   const history = settings.usageHistory?.[key] || [];
   const sample = history.length ? history : [{ input: 1500, output: 1000 }];
   const valid = balances.filter(b => ["CNY", "USD"].includes(b.currency) && Number.isFinite(b.amount) && b.amount >= 0);
@@ -1034,6 +1046,11 @@ function currentUsageAccount() {
   const provider = PROVIDERS[settings.provider] ? settings.provider : "claude";
   const base = provider === "custom" ? settings.customBase : PROVIDERS[provider].base || "";
   return { provider, base, model: aiModel(), token: aiKey() };
+}
+
+function selectProgressBalance(balances, currency) {
+  const preferred = balances.find(b => b.currency === currency);
+  return (preferred?.amount > 0 ? preferred : balances.find(b => b.amount > 0)) ?? preferred ?? balances[0];
 }
 
 async function showRequestUsage(box, { provider, base, model, token }) {
@@ -1077,23 +1094,23 @@ async function showRequestUsage(box, { provider, base, model, token }) {
     const estimates = estimateBalances(balances, provider, model, key, currency, settings.manualCosts?.[key]);
     status.textContent = estimates.map(b =>
       (official ? "余额 " : "手动填写的余额 ") + formatBalance(b) +
-      (b.remaining == null ? " · 剩余次数待估算" : " · 预计还能生成 " + b.remaining.toLocaleString("zh-CN") + " 次解说")
+      (b.remaining == null ? " · 未知单次成本，可在设置中填写" : " · 预计还能生成 " + b.remaining.toLocaleString("zh-CN") + " 次解说")
     ).join("；");
 
     if (recharge) {
-      for (const b of estimates) {
-        const levelKey = JSON.stringify([token, b.currency]);
-        const previous = balanceLevels.get(levelKey);
-        // Start a new scale when a balance increase is observed.
-        const max = !previous || b.amount > previous.amount ? b.amount : previous.max;
-        balanceLevels.set(levelKey, { amount: b.amount, max });
-        const progress = document.createElement("progress");
-        progress.max = max || 1;
-        progress.value = b.amount;
-        progress.style.cssText = "display:block;width:100%;cursor:pointer";
-        progress.setAttribute("aria-label", b.currency + " 余额进度");
-        recharge.prepend(progress);
-      }
+      const b = selectProgressBalance(estimates, currency);
+      const levelKey = JSON.stringify([token, b.currency]);
+      const previous = balanceLevels.get(levelKey);
+      // Start a new scale when a balance increase is observed.
+      const max = !previous || b.amount > previous.amount ? b.amount : previous.max;
+      balanceLevels.set(levelKey, { amount: b.amount, max });
+      const progress = document.createElement("progress");
+      progress.max = max || 1;
+      progress.value = b.amount;
+      progress.style.cssText = "display:block;width:100%;cursor:pointer";
+      progress.title = b.currency + " 余额进度";
+      progress.setAttribute("aria-label", progress.title);
+      recharge.prepend(progress);
     }
   } catch (error) {
     status.textContent = error.message;
