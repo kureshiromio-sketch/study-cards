@@ -473,9 +473,89 @@ function setBar(title, backHref) {
 }
 function setTab(t) { document.querySelectorAll("#tabs a").forEach(a => a.classList.toggle("on", a.dataset.tab === t)); }
 
+const VOCAB_DECK_ID = "vocabulary-book";
+
+function vocabularyTerm(value) {
+  const term = value.normalize("NFC").replace(/\s+/g, " ").trim();
+  return term.length <= 120 && /\p{L}/u.test(term) ? term : "";
+}
+
+function addVocabulary(value, meaning = "") {
+  const term = vocabularyTerm(value);
+  if (!term) return toast("请选择单词或短语（最多 120 字）");
+  const id = "vocab_" + encodeURIComponent(term);
+  if (get(id)) return toast("已在单词本");
+  const card = { kind: "card", id, data: {
+    type: "flash", q: term, a: meaning, deckId: VOCAB_DECK_ID, order: Date.now(),
+  } };
+  if (get(VOCAB_DECK_ID)) put(card.kind, card.id, card.data);
+  else putMany([
+    { kind: "deck", id: VOCAB_DECK_ID, data: { name: "单词本", subject: "词汇", newPerDay: 20, sessionSize: 20 } },
+    card,
+  ]);
+  toast("已加入单词本");
+  if (location.hash === "#/vocabulary" || location.hash === "#/deck/" + VOCAB_DECK_ID) deckView(VOCAB_DECK_ID);
+}
+
+function vocabularyView() {
+  if (get(VOCAB_DECK_ID)) return deckView(VOCAB_DECK_ID);
+  setBar("单词本", "#/"); setTab("home");
+  view().innerHTML = '<div class="card empty">单词本还是空的。选中 App 内的单词或短语即可加入。</div>';
+}
+
+function wrongAnswerVocabulary(card) {
+  const d = card.data;
+  if (d.deckId === VOCAB_DECK_ID) return;
+  const highlighted = [...d.q.matchAll(/＿([^＿\n]+)＿|<u>(.*?)<\/u>/gi)];
+  const candidate = d.type === "flash" ? d.q
+    : highlighted.length === 1 ? highlighted[0][1] ?? highlighted[0][2] : d.options[d.answer];
+  const term = vocabularyTerm(candidate || "");
+  const row = document.createElement("div");
+  row.className = "row";
+  row.style.marginTop = "8px";
+  const button = document.createElement("button");
+  button.className = "small secondary";
+  button.textContent = "加入单词本";
+  button.onclick = () => {
+    const value = window.prompt("要加入单词本的单词或短语", term);
+    if (value == null || !vocabularyTerm(value)) return;
+    addVocabulary(value, d.type === "flash" && vocabularyTerm(value) === term ? d.a || "" : "");
+    button.textContent = "已收入单词本";
+  };
+  row.append(button);
+  $("#after").append(row);
+}
+
+function bindVocabularySelection() {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "small secondary";
+  button.textContent = "＋ 加入单词本";
+  button.hidden = true;
+  button.style.cssText = "position:fixed;right:16px;bottom:calc(112px + env(safe-area-inset-bottom));z-index:20";
+  document.body.append(button);
+
+  let term = "";
+  document.addEventListener("selectionchange", () => {
+    const selection = window.getSelection();
+    const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+    term = range && !range.collapsed && view().contains(range.commonAncestorContainer)
+      ? vocabularyTerm(selection.toString()) : "";
+    button.hidden = !term;
+  });
+  button.addEventListener("pointerdown", e => e.preventDefault());
+  button.addEventListener("click", () => {
+    if (!term) return;
+    addVocabulary(term);
+    window.getSelection()?.removeAllRanges();
+    button.hidden = true;
+  });
+  window.addEventListener("hashchange", () => { term = ""; button.hidden = true; });
+}
+
 function homeView() {
   setBar("刷题卡片"); setTab("home");
-  const decks = all("deck").sort((a, b) => (a.data.order ?? 0) - (b.data.order ?? 0) || a.updated_at - b.updated_at);
+  const decks = all("deck").filter(d => d.id !== VOCAB_DECK_ID).sort((a, b) => (a.data.order ?? 0) - (b.data.order ?? 0) || a.updated_at - b.updated_at);
   view().innerHTML = (decks.length ? decks.map(d => {
     const s = deckStats(d.id); const r = roundProgress(d.id);
     const pct = r.total ? Math.round((r.done / r.total) * 100) : 0;
@@ -485,6 +565,7 @@ function homeView() {
       <div class="stats"><span>${r.round > 1 ? `第 ${r.round} 轮 · ` : ""}进度 <b>${r.done}</b> / ${r.total}</span><span class="bad"><b>${s.book}</b> 错题</span></div></div>`;
   }).join("") : `<div class="empty">还没有 session，点下面新建一个</div>`) +
     `<button id="new-deck" style="width:100%">＋ 新建 session</button>`;
+  view().insertAdjacentHTML("afterbegin", '<div class="row" style="margin-bottom:10px"><a class="btn secondary" href="#/vocabulary">单词本</a></div>');
   $("#new-deck").onclick = () => { location.hash = "#/deck-edit/new"; };
   view().querySelectorAll("[data-deck]").forEach(el => el.onclick = e => { if (e.target.closest(".more")) return; startDeck(el.dataset.deck); });
 }
@@ -760,6 +841,7 @@ function studyView() {
     view().querySelectorAll(".opt").forEach(x => { const i = +x.dataset.i; x.disabled = true; if (i === d.answer) x.classList.add("right"); else if (i === pick) x.classList.add("wrong"); });
     $("#after").innerHTML = `<div class="verdict ${ok ? "ok" : "bad"}">${ok ? "✓ 正确" : "✗ 错了，已加入错题本"}</div>${d.note ? `<div class="note">${esc(d.note)}</div>` : ""}<div class="ai" id="ai"></div>`;
     $("#actions").innerHTML = `<div class="row"><button id="ai-btn" class="secondary">查看解析</button></div>${navRow}`;
+    if (!ok) wrongAnswerVocabulary(card);
     $("#ai-btn").onclick = () => runAI(card, pick);
     bindNav();
     if (fresh) setTimeout(() => $("#after").scrollIntoView({ behavior: "smooth", block: "center" }), 50);
@@ -785,9 +867,11 @@ function studyView() {
       : `<div class="row"><button id="forgot" class="danger">✗ 不记得</button><button id="knew" style="background:var(--ok)">✓ 记得</button></div>`) +
       `<div class="row"><button id="ai-btn" class="secondary">查看解析</button></div>${r ? navRow : ""}`;
     $("#ai-btn").onclick = () => runAI(card, null);
-    if (r) bindNav();
-    else {
-      $("#forgot").onclick = () => { answer(false); go(1); };
+    if (r) {
+      if (!r.ok) wrongAnswerVocabulary(card);
+      bindNav();
+    } else {
+      $("#forgot").onclick = () => { answer(false); if (d.deckId === VOCAB_DECK_ID) go(1); else flipped(); };
       $("#knew").onclick = () => { answer(true); go(1); };
     }
   };
@@ -812,7 +896,7 @@ function bindNav() {
     x0 = e.touches[0].clientX; y0 = e.touches[0].clientY; t0 = Date.now();
   }, { passive: true });
   document.addEventListener("touchend", e => {
-    if (x0 == null || !S) return;
+    if (x0 == null || !S || window.getSelection()?.isCollapsed === false) { x0 = null; return; }
     const t = e.changedTouches[0]; const dx = t.clientX - x0, dy = t.clientY - y0; x0 = null;
     if (Math.abs(dx) < 60 || Math.abs(dy) > Math.abs(dx) * 0.7 || Date.now() - t0 > 800) return;
     if (dx < 0) { if (S.idx < S.queue.length) go(1); } else go(-1);
@@ -1250,6 +1334,7 @@ function route() {
     case "import": return importView(h[1]);
     case "study": return studyView();
     case "wrong": return wrongView();
+    case "vocabulary": return vocabularyView();
     case "settings": return settingsView();
     default: return homeView();
   }
@@ -1272,6 +1357,7 @@ async function main() {
   if (sb && sbUser) await syncNow();
   if (![...items.values()].some(it => it.kind === "deck")) await seed();
   window.addEventListener("hashchange", route);
+  bindVocabularySelection();
   route();
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") syncNow(); else scheduleSync(500); });
   if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost")) {
