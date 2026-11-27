@@ -817,6 +817,7 @@ async function runAI(card, pick) {
   const cached = get(card.id)?.data.ai;
   if (cached?.text) { btn.style.display = "none"; return renderChat(card, pick); }
   btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> AI 正在解析…';
+  const usageAccount = currentUsageAccount();
   let acc = ""; box.innerHTML = "";
   try {
     const res = await explain(card, pick, t => { acc += t; box.innerHTML = md(acc); });
@@ -826,6 +827,8 @@ async function runAI(card, pick) {
     console.error(e);
     box.innerHTML = `<div class="note" style="color:var(--bad)">解析失败：${esc(aiErrMsg(e))}</div>`;
     btn.disabled = false; btn.textContent = "重试解析";
+  } finally {
+    void showRequestUsage(box, usageAccount);
   }
 }
 // 解析 + 追问对话
@@ -849,6 +852,7 @@ function renderChat(card, pick) {
     if (!quick) input.value = ""; input.disabled = true; $("#ask-go").disabled = true; box.querySelectorAll(".chip").forEach(b => b.disabled = true);
     const live = $("#chat-live");
     live.innerHTML = `<div class="bubble me">${esc(label || question)}</div><div class="bubble" id="live-ans"><span class="spinner"></span></div>`;
+    const usageAccount = currentUsageAccount();
     let acc = "";
     try {
       const res = await callAI(history, t => { acc += t; $("#live-ans").innerHTML = md(acc); });
@@ -860,6 +864,8 @@ function renderChat(card, pick) {
       console.error(e);
       $("#live-ans").innerHTML = `<span style="color:var(--bad)">失败：${esc(aiErrMsg(e))}</span>`;
       input.disabled = false; if (!quick) input.value = question; $("#ask-go").disabled = false; box.querySelectorAll(".chip").forEach(b => b.disabled = false);
+    } finally {
+      void showRequestUsage(box, usageAccount);
     }
   };
   $("#ask-go").onclick = () => send();
@@ -980,6 +986,120 @@ function recordUsage(provider, base, model, usage) {
   saveSettings();
 }
 
+async function fetchDeepSeekBalances(token) {
+  if (!token) throw new Error("请先保存 DeepSeek API Key");
+  let response;
+  try {
+    response = await fetch("https://api.deepseek.com/user/balance", {
+      headers: { Authorization: "Bearer " + token },
+      cache: "no-store",
+      signal: AbortSignal.timeout(12000),
+    });
+} catch {
+  throw new Error("余额查询失败，请检查网络或前往 DeepSeek 控制台查看");
+}
+if (!response.ok) throw new Error("余额查询失败（HTTP " + response.status + "）");
+const data = await response.json();
+if (!Array.isArray(data.balance_infos)) throw new Error("服务商没有返回余额");
+return data.balance_infos.map(b => ({ currency: b.currency, amount: Number(b.total_balance) }));
+}
+
+function estimateBalances(balances, provider, model, key, currency, cost) {
+  // DeepSeek peak prices per million tokens. Assume no cache discount.
+  const modelRates = provider === "deepseek" && Object.hasOwn(DEEPSEEK_ESTIMATE_RATES, model)
+    ? DEEPSEEK_ESTIMATE_RATES[model] : null;
+  const history = settings.usageHistory?.[key] || [];
+  const sample = history.length ? history : [{ input: 1500, output: 1000 }];
+  const valid = balances.filter(b => ["CNY", "USD"].includes(b.currency) && Number.isFinite(b.amount) && b.amount >= 0);
+  if (!valid.length) throw new Error("服务商没有返回可用余额");
+  return valid.map(b => {
+    const manual = b.currency === currency && cost > 0;
+    const rates = modelRates?.[b.currency];
+    const average = manual ? cost : rates
+      ? sample.reduce((sum, u) => sum + (u.input * rates[0] + u.output * rates[1]) / 1e6, 0) / sample.length
+      : 0;
+    const basis = manual ? "按填写的单次成本" : history.length ? "近期用量，按高峰无缓存价格" : "按典型用量和高峰无缓存价格";
+    return { ...b, remaining: average > 0 ? Math.floor(b.amount / average) : null, basis };
+  });
+}
+
+function formatBalance(balance) {
+  return balance.currency + " " + balance.amount.toLocaleString("zh-CN", { maximumFractionDigits: 6 });
+}
+
+const DEEPSEEK_TOP_UP = "https://platform.deepseek.com/top_up";
+const balanceLevels = new Map();
+
+function currentUsageAccount() {
+  const provider = PROVIDERS[settings.provider] ? settings.provider : "claude";
+  const base = provider === "custom" ? settings.customBase : PROVIDERS[provider].base || "";
+  return { provider, base, model: aiModel(), token: aiKey() };
+}
+
+async function showRequestUsage(box, { provider, base, model, token }) {
+  if (!box.isConnected) return;
+  box.querySelector("[data-request-usage]")?.remove();
+  const footer = document.createElement("div");
+  footer.dataset.requestUsage = "";
+  footer.className = "muted";
+  footer.style.marginTop = "10px";
+  const status = document.createElement("div");
+  status.setAttribute("role", "status");
+  footer.append(status);
+  box.append(footer);
+
+  const official = provider === "deepseek";
+  const account = settings.manualBalances?.[usageKey(provider, base, "")];
+  const key = usageKey(provider, base, model);
+  const currency = account?.currency || "USD";
+  if (!official && (account?.amount == null || account.amount === "")) {
+    status.textContent = "余额与剩余次数可在「设置 → AI 解析」中手动估算";
+    return;
+  }
+
+  let recharge;
+  if (official) {
+    recharge = document.createElement("a");
+    recharge.href = DEEPSEEK_TOP_UP;
+    recharge.target = "_blank";
+    recharge.rel = "noopener noreferrer";
+    recharge.style.display = "block";
+    recharge.textContent = "前往 DeepSeek 充值 ↗";
+    footer.append(recharge);
+    status.textContent = "正在刷新余额…";
+  }
+
+  try {
+    const balances = official
+      ? await fetchDeepSeekBalances(token)
+      : [{ currency, amount: Number(account.amount) }];
+    if (!footer.isConnected || token !== aiKey() || provider !== currentUsageAccount().provider) return;
+    const estimates = estimateBalances(balances, provider, model, key, currency, settings.manualCosts?.[key]);
+    status.textContent = estimates.map(b =>
+      (official ? "余额 " : "手动填写的余额 ") + formatBalance(b) +
+      (b.remaining == null ? " · 剩余次数待估算" : " · 预计还能生成 " + b.remaining.toLocaleString("zh-CN") + " 次解说")
+    ).join("；");
+
+    if (recharge) {
+      for (const b of estimates) {
+        const levelKey = JSON.stringify([token, b.currency]);
+        const previous = balanceLevels.get(levelKey);
+        // Start a new scale when a balance increase is observed.
+        const max = !previous || b.amount > previous.amount ? b.amount : previous.max;
+        balanceLevels.set(levelKey, { amount: b.amount, max });
+        const progress = document.createElement("progress");
+        progress.max = max || 1;
+        progress.value = b.amount;
+        progress.style.cssText = "display:block;width:100%;cursor:pointer";
+        progress.setAttribute("aria-label", b.currency + " 余额进度");
+        recharge.prepend(progress);
+      }
+    }
+  } catch (error) {
+    status.textContent = error.message;
+  }
+}
+
 function renderAPIUsage(box, provider, model) {
   const base = provider === "custom" ? settings.customBase : PROVIDERS[provider].base || "";
   const account = usageKey(provider, base, "");
@@ -1011,43 +1131,16 @@ function renderAPIUsage(box, provider, model) {
       let balances;
       if (official) {
         const token = aiKey();
-        if (!token) throw new Error("请先保存 DeepSeek API Key");
-        let response;
-        try {
-          response = await fetch("https://api.deepseek.com/user/balance", {
-            headers: { Authorization: "Bearer " + token },
-            cache: "no-store",
-            signal: AbortSignal.timeout(12000),
-          });
-        } catch {
-          throw new Error("余额查询失败，请检查网络或前往 DeepSeek 控制台查看");
-        }
-        if (!response.ok) throw new Error("余额查询失败（HTTP " + response.status + "）");
-        const data = await response.json();
-        if (!Array.isArray(data.balance_infos)) throw new Error("服务商没有返回余额");
-        balances = data.balance_infos.map(b => ({ currency: b.currency, amount: Number(b.total_balance) }));
+        balances = await fetchDeepSeekBalances(token);
       } else {
         if (!balanceInput.value) throw new Error("此服务商尚未接入余额查询，请输入控制台余额");
         balances = [{ currency, amount: balanceInput.valueAsNumber }];
       }
-      // DeepSeek peak prices per million tokens. Assume no cache discount.
-      const modelRates = official && Object.hasOwn(DEEPSEEK_ESTIMATE_RATES, model) ? DEEPSEEK_ESTIMATE_RATES[model] : null;
-      const history = settings.usageHistory?.[key] || [];
-      const sample = history.length ? history : [{ input: 1500, output: 1000 }];
-      const valid = balances.filter(b => ["CNY", "USD"].includes(b.currency) && Number.isFinite(b.amount) && b.amount >= 0);
-      if (!valid.length) throw new Error("服务商没有返回可用余额");
-      result.textContent = valid.map(b => {
-        const manual = b.currency === currency && cost > 0 ? cost : null;
-        const rates = modelRates?.[b.currency];
-        const average = manual ?? (rates
-          ? sample.reduce((sum, u) => sum + (u.input * rates[0] + u.output * rates[1]) / 1e6, 0) / sample.length
-          : null);
+      result.textContent = estimateBalances(balances, provider, model, key, currency, cost).map(b => {
         const label = official ? "账户余额" : "手动填写的余额";
-        const estimate = average > 0
-          ? "，预计约 " + Math.floor(b.amount / average).toLocaleString("zh-CN") + " 次（" +
-            (manual ? "按填写的单次成本" : history.length ? "近期用量，按高峰无缓存价格" : "按典型用量和高峰无缓存价格") + "）"
-          : "，填写同币种的单次成本即可估算";
-        return label + " " + b.currency + " " + b.amount.toLocaleString("zh-CN") + estimate;
+        const estimate = b.remaining == null ? "，填写同币种的单次成本即可估算"
+          : "，预计约 " + b.remaining.toLocaleString("zh-CN") + " 次（" + b.basis + "）";
+        return label + " " + formatBalance(b) + estimate;
       }).join("；");
     } catch (error) {
       result.textContent = error.message;
