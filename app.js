@@ -206,9 +206,14 @@ function buildQueue(deckId, mode) {
 // ---------- AI explanation ----------
 let AnthropicCtor = null;
 const DEFAULT_PROMPTS = {
-  system: "你是语言考试辅导老师，学生是中文母语者。用简体中文回答，外语原文保留。回答要短：只讲关键点，不要开场白、不要总结、不要重复题目，总长度控制在 150 字以内。用简短的要点列表。",
-  choice: "简要解析：\n- 正确答案为什么对（一句话，附中文意思）\n- 每个错误选项错在哪（各一句）\n- 一个例句（附翻译）",
-  flash: "简要讲解：\n- 读音和词性\n- 核心意思（如有易混词，一句话说明区别）\n- 2 个例句（附翻译）",
+  system: "你是语言考试辅导老师，学生是中文母语者。用简体中文回答，外语原文保留。回答尽量简短，只讲被问到的内容，不要开场白、不要总结、不要重复题目。",
+  choice: "只解析正确选项：为什么选它（1～2 句，附中文意思）。不要分析其他选项，不要给例句。",
+  flash: "只给三部分：\n- 释义（读音、词性、中文意思）\n- 语源或词根（一句话）\n- 3 个用法不同的例句（附翻译）",
+};
+// 追问框的快捷按钮：[按钮文字, 实际发给 AI 的话]
+const QUICK_ASKS = {
+  choice: [["各项解析", "逐个分析每个选项：意思，以及为什么对或不对，各一句。"], ["判断要点", "这类题怎么快速判断？给出解题的关键线索。"], ["记忆要点", "给一个好记的记忆方法或要点。"]],
+  flash: [["易混词", "列出容易混淆的词，各用一句话说明区别。"], ["常见搭配", "列出这个词最常见的搭配，附中文。"], ["记忆要点", "给一个好记的记忆方法或要点。"]],
 };
 // 自定义提示词存在云端（kind 'conf'），留空就用默认
 function prompts() { const c = get("conf_prompts")?.data || {}; const o = {}; for (const k in DEFAULT_PROMPTS) o[k] = (c[k] || "").trim() || DEFAULT_PROMPTS[k]; return o; }
@@ -707,33 +712,36 @@ function renderChat(card, pick) {
   const ai = get(card.id)?.data.ai; if (!ai) return;
   const chat = ai.chat || [];
   box.innerHTML = md(ai.text) +
-    chat.map(m => m.role === "user" ? `<div class="bubble me">${esc(m.content)}</div>` : `<div class="bubble">${md(m.content)}</div>`).join("") +
+    chat.map(m => m.role === "user" ? `<div class="bubble me">${esc(m.label || m.content)}</div>` : `<div class="bubble">${md(m.content)}</div>`).join("") +
     `<div id="chat-live"></div>
+     <div class="chips">${QUICK_ASKS[card.data.type === "choice" ? "choice" : "flash"].map(([l], i) => `<button class="chip" data-q="${i}">${l}</button>`).join("")}</div>
      <div class="ask-row"><input id="ask" placeholder="继续追问，比如：再给两个例句" enterkeyhint="send"><button id="ask-go" class="small">发送</button></div>
      <div class="muted" style="margin-top:6px;display:flex;gap:14px"><a href="#" id="regen">重新生成解析</a>${chat.length ? `<a href="#" id="clear-chat">清空追问</a>` : ""}</div>`;
   $("#regen").onclick = e => { e.preventDefault(); if (chat.length && !confirm("重新生成会清空追问记录，确定吗？")) return; const c = get(card.id); const nd = { ...c.data }; delete nd.ai; put("card", card.id, nd); runAI(card, pick); };
   $("#clear-chat")?.addEventListener("click", e => { e.preventDefault(); const c = get(card.id); put("card", card.id, { ...c.data, ai: { ...c.data.ai, chat: [] } }); renderChat(card, pick); });
-  const send = async () => {
-    const input = $("#ask"); const question = input.value.trim(); if (!question) return;
+  const send = async (quick) => {
+    const input = $("#ask"); const question = quick ? quick[1] : input.value.trim(); if (!question) return;
+    const label = quick ? quick[0] : null;
     const c = get(card.id); const a = c.data.ai;
-    const history = [{ role: "user", content: a.q || buildPrompt(c, pick) }, { role: "assistant", content: a.text }, ...(a.chat || []), { role: "user", content: question }];
-    input.value = ""; input.disabled = true; $("#ask-go").disabled = true;
+    const history = [{ role: "user", content: a.q || buildPrompt(c, pick) }, { role: "assistant", content: a.text }, ...(a.chat || []).map(m => ({ role: m.role, content: m.content })), { role: "user", content: question }];
+    if (!quick) input.value = ""; input.disabled = true; $("#ask-go").disabled = true; box.querySelectorAll(".chip").forEach(b => b.disabled = true);
     const live = $("#chat-live");
-    live.innerHTML = `<div class="bubble me">${esc(question)}</div><div class="bubble" id="live-ans"><span class="spinner"></span></div>`;
+    live.innerHTML = `<div class="bubble me">${esc(label || question)}</div><div class="bubble" id="live-ans"><span class="spinner"></span></div>`;
     let acc = "";
     try {
       const res = await callAI(history, t => { acc += t; $("#live-ans").innerHTML = md(acc); });
       const c2 = get(card.id);
-      put("card", card.id, { ...c2.data, ai: { ...c2.data.ai, chat: [...(c2.data.ai.chat || []), { role: "user", content: question }, { role: "assistant", content: res.text }] } });
+      put("card", card.id, { ...c2.data, ai: { ...c2.data.ai, chat: [...(c2.data.ai.chat || []), { role: "user", content: question, ...(label ? { label } : {}) }, { role: "assistant", content: res.text }] } });
       renderChat(card, pick);
       setTimeout(() => $("#ask")?.scrollIntoView({ behavior: "smooth", block: "center" }), 50);
     } catch (e) {
       console.error(e);
       $("#live-ans").innerHTML = `<span style="color:var(--bad)">失败：${esc(aiErrMsg(e))}</span>`;
-      input.disabled = false; input.value = question; $("#ask-go").disabled = false;
+      input.disabled = false; if (!quick) input.value = question; $("#ask-go").disabled = false; box.querySelectorAll(".chip").forEach(b => b.disabled = false);
     }
   };
-  $("#ask-go").onclick = send;
+  $("#ask-go").onclick = () => send();
+  box.querySelectorAll(".chip").forEach(b => b.onclick = () => send(QUICK_ASKS[card.data.type === "choice" ? "choice" : "flash"][+b.dataset.q]));
   $("#ask").addEventListener("keydown", e => { if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); send(); } });
 }
 function studyDone() {

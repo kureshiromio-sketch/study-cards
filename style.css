@@ -126,3 +126,5 @@ pre.fmt { white-space: pre-wrap; font-size: 12px; background: var(--bg); padding
 .ask-row { display: flex; gap: 8px; margin-top: 12px; }
 .ask-row input { flex: 1; }
 .ask-row button { flex: 0 0 auto; min-height: 44px; }
+.chips { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+.chip { min-height: 0; padding: 6px 12px; font-size: 14px; border-radius: 99px; background: var(--accent-soft); color: var(--accent); }
