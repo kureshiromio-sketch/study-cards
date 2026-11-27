@@ -85,7 +85,7 @@ const PROVIDERS = {
   claude: { name: "Claude（Anthropic）", keyHint: "sk-ant-…", keyUrl: "https://console.anthropic.com",
     models: [["claude-opus-5-5", "Claude Opus 5.5（最准确）"], ["claude-sonnet-5-5", "Claude Sonnet 5.5（便宜一半）"], ["claude-haiku-5-5", "Claude Haiku 5.5（最便宜最快）"]] },
   deepseek: { name: "DeepSeek", base: "https://api.deepseek.com/v1", keyHint: "sk-…", keyUrl: "https://platform.deepseek.com",
-    models: [["deepseek-chat", "deepseek-chat（快）"], ["deepseek-reasoner", "deepseek-reasoner（会先思考，慢一些）"]] },
+    models: [["deepseek-chat", "deepseek-chat（快）"], ["deepseek-reasoner", "deepseek-reasoner（会先思考，慢一些）"], ["deepseek-flash", "deepseek-flash"], ["deepseek-v4-pro", "deepseek-v4-pro"]] },
   qwen: { name: "通义千问（阿里云百炼）", base: "https://dashscope.aliyuncs.com/compatible-mode/v1", keyHint: "sk-…", keyUrl: "https://bailian.console.aliyun.com",
     models: [["qwen-plus", "qwen-plus（推荐）"], ["qwen-max", "qwen-max（最强）"], ["qwen-turbo", "qwen-turbo（最便宜）"]] },
   custom: { name: "其他（OpenAI 兼容接口）", keyHint: "API Key", models: [] },
@@ -349,14 +349,14 @@ async function explainOpenAICompat(prov, system, messages, onText) {
     res = await fetch(base + "/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + aiKey() },
-      body: JSON.stringify({ model, stream: true, max_tokens: 4000, messages: [{ role: "system", content: system }, ...messages] }),
+      body: JSON.stringify({ model, stream: true, ...(prov === "deepseek" ? { stream_options: { include_usage: true } } : {}), max_tokens: 4000, messages: [{ role: "system", content: system }, ...messages] }),
     });
   } catch (e) { throw new Error("连不上接口（网络问题，或这个服务不允许网页直接调用）"); }
   if (!res.ok) {
     let msg = ""; try { const j = await res.json(); msg = j.error?.message || j.message || JSON.stringify(j); } catch {}
     const err = new Error(`${res.status} ${msg}`.trim()); err.status = res.status; throw err;
   }
-  const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = "", text = "";
+  const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = "", text = "", usage;
   for (;;) {
     const { value, done } = await reader.read(); if (done) break;
     buf += dec.decode(value, { stream: true });
@@ -365,10 +365,11 @@ async function explainOpenAICompat(prov, system, messages, onText) {
       const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
       if (!line.startsWith("data:")) continue;
       const data = line.slice(5).trim(); if (data === "[DONE]") continue;
-      try { const t = JSON.parse(data).choices?.[0]?.delta?.content; if (t) { text += t; onText(t); } } catch {}
+      try { const chunk = JSON.parse(data); usage = chunk.usage || usage; const t = chunk.choices?.[0]?.delta?.content; if (t) { text += t; onText(t); } } catch {}
     }
   }
   if (!text) throw new Error("接口没有返回内容");
+  recordUsage(prov, base, model, usage);
   return { text, model, at: Date.now() };
 }
 
@@ -965,6 +966,102 @@ function renderPromptSettings() {
   $("#pr-save").onclick = save;
   $("#prompt-card").querySelectorAll("[data-reset]").forEach(a => a.onclick = e => { e.preventDefault(); $("#pr-" + a.dataset.reset).value = DEFAULT_PROMPTS[a.dataset.reset]; save(); });
 }
+function usageKey(provider, base, model) {
+  return JSON.stringify([provider, base.replace(/\/+$/, ""), model]);
+}
+
+function recordUsage(provider, base, model, usage) {
+  const input = usage?.prompt_tokens;
+  const output = usage?.completion_tokens;
+  if (!Number.isFinite(input) || !Number.isFinite(output) || input < 0 || output < 0 || input + output === 0) return;
+  const key = usageKey(provider, base, model);
+  const history = settings.usageHistory ||= {};
+  history[key] = [...(history[key] || []).slice(-19), { input, output }];
+  saveSettings();
+}
+
+function renderAPIUsage(box, provider, model) {
+  const base = provider === "custom" ? settings.customBase : PROVIDERS[provider].base || "";
+  const account = usageKey(provider, base, "");
+  const key = usageKey(provider, base, model);
+  const manualBalances = settings.manualBalances ||= {};
+  const manualCosts = settings.manualCosts ||= {};
+  const saved = manualBalances[account] || {};
+  const official = provider === "deepseek";
+  const button = box.querySelector("#usage-refresh");
+  const result = box.querySelector("#usage-result");
+  const costInput = box.querySelector("#usage-cost");
+  const currencyInput = box.querySelector("#usage-currency");
+  const balanceInput = box.querySelector("#usage-balance");
+  costInput.value = manualCosts[key] ?? "";
+  currencyInput.value = saved.currency || "USD";
+  if (balanceInput) balanceInput.value = saved.amount ?? "";
+  button.onclick = async () => {
+    if (!costInput.reportValidity() || (balanceInput && !balanceInput.reportValidity())) return;
+    const cost = costInput.valueAsNumber;
+    const currency = currencyInput.value;
+    if (Number.isFinite(cost) && cost > 0) manualCosts[key] = cost;
+    else delete manualCosts[key];
+    if (balanceInput) manualBalances[account] = { amount: balanceInput.value, currency };
+    else manualBalances[account] = { currency };
+    saveSettings();
+    button.disabled = true;
+    result.textContent = official ? "正在查询…" : "";
+    try {
+      let balances;
+      if (official) {
+        const token = aiKey();
+        if (!token) throw new Error("请先保存 DeepSeek API Key");
+        let response;
+        try {
+          response = await fetch("https://api.deepseek.com/user/balance", {
+            headers: { Authorization: "Bearer " + token },
+            cache: "no-store",
+            signal: AbortSignal.timeout(12000),
+          });
+        } catch {
+          throw new Error("余额查询失败，请检查网络或前往 DeepSeek 控制台查看");
+        }
+        if (!response.ok) throw new Error("余额查询失败（HTTP " + response.status + "）");
+        const data = await response.json();
+        if (!Array.isArray(data.balance_infos)) throw new Error("服务商没有返回余额");
+        balances = data.balance_infos.map(b => ({ currency: b.currency, amount: Number(b.total_balance) }));
+      } else {
+        if (!balanceInput.value) throw new Error("此服务商尚未接入余额查询，请输入控制台余额");
+        balances = [{ currency, amount: balanceInput.valueAsNumber }];
+      }
+      // DeepSeek peak prices per million tokens. Assume no cache discount.
+      const modelRates = official && Object.hasOwn(DEEPSEEK_ESTIMATE_RATES, model) ? DEEPSEEK_ESTIMATE_RATES[model] : null;
+      const history = settings.usageHistory?.[key] || [];
+      const sample = history.length ? history : [{ input: 1500, output: 1000 }];
+      const valid = balances.filter(b => ["CNY", "USD"].includes(b.currency) && Number.isFinite(b.amount) && b.amount >= 0);
+      if (!valid.length) throw new Error("服务商没有返回可用余额");
+      result.textContent = valid.map(b => {
+        const manual = b.currency === currency && cost > 0 ? cost : null;
+        const rates = modelRates?.[b.currency];
+        const average = manual ?? (rates
+          ? sample.reduce((sum, u) => sum + (u.input * rates[0] + u.output * rates[1]) / 1e6, 0) / sample.length
+          : null);
+        const label = official ? "账户余额" : "手动填写的余额";
+        const estimate = average > 0
+          ? "，预计约 " + Math.floor(b.amount / average).toLocaleString("zh-CN") + " 次（" +
+            (manual ? "按填写的单次成本" : history.length ? "近期用量，按高峰无缓存价格" : "按典型用量和高峰无缓存价格") + "）"
+          : "，填写同币种的单次成本即可估算";
+        return label + " " + b.currency + " " + b.amount.toLocaleString("zh-CN") + estimate;
+      }).join("；");
+    } catch (error) {
+      result.textContent = error.message;
+    } finally {
+      button.disabled = false;
+    }
+  };
+}
+
+const DEEPSEEK_ESTIMATE_RATES = {
+  "deepseek-flash": { USD: [0.3, 1.2], CNY: [2, 8] },
+  "deepseek-v4-pro": { USD: [1.32, 3.96], CNY: [9, 27] },
+};
+
 function renderAISettings() {
   const box = $("#ai-card"); const prov = PROVIDERS[settings.provider] ? settings.provider : "claude"; const P = PROVIDERS[prov];
   const cur = aiModel();
@@ -979,7 +1076,15 @@ function renderAISettings() {
     <input id="model-txt" value="${esc(preset ? "" : cur)}" placeholder="模型名称，例如 qwen-plus" style="margin-top:6px;${P.models.length && preset ? "display:none" : ""}">
     ${prov === "claude" ? `<label>思考深度</label><select id="effort">${[["low", "快速（推荐）"], ["medium", "标准"], ["high", "深入（更慢）"]].map(([v, t]) => `<option value="${v}" ${settings.effort === v ? "selected" : ""}>${t}</option>`).join("")}</select>` : ""}
     <div class="muted" style="margin-top:8px">同一道题的解析会被保存，第二次查看不再花钱。</div>
-    <button id="key-save" style="width:100%;margin-top:10px">保存</button>`;
+    <button id="key-save" style="width:100%;margin-top:10px">保存</button>
+    <label>API 余额与预计剩余请求</label>
+    <div class="muted">按已保存的模型查询。实际消耗随题目长度和回答长度变化。</div>
+    <label for="usage-currency">手动估算币种</label><select id="usage-currency"><option>USD</option><option>CNY</option></select>
+    ${prov === "deepseek" ? "" : `<label for="usage-balance">控制台余额</label><input id="usage-balance" type="number" min="0" step="any" inputmode="decimal">`}
+    <label for="usage-cost">单次成本（可手动填写）</label><input id="usage-cost" type="number" min="0" step="any" inputmode="decimal">
+    <button id="usage-refresh" style="width:100%;margin-top:10px">${prov === "deepseek" ? "查询余额并估算" : "计算剩余次数"}</button>
+    <div id="usage-result" class="muted" role="status" style="margin-top:8px"></div>`;
+  renderAPIUsage(box, prov, cur);
   $("#prov").onchange = e => { settings.provider = e.target.value; saveSettings(); renderAISettings(); };
   $("#model")?.addEventListener("change", e => { $("#model-txt").style.display = e.target.value === "__other" ? "" : "none"; });
   $("#key-save").onclick = () => {
@@ -988,7 +1093,7 @@ function renderAISettings() {
     settings.models = { ...(settings.models || {}), [prov]: m };
     if (prov === "custom") settings.customBase = $("#base").value.trim();
     if ($("#effort")) settings.effort = $("#effort").value;
-    saveSettings(); toast("已保存");
+    saveSettings(); renderAISettings(); toast("已保存");
   };
 }
 
