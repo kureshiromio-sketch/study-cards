@@ -19,3 +19,5 @@ create or replace function public.touch_items() returns trigger
 drop trigger if exists items_touch on public.items;
 create trigger items_touch before insert or update on public.items
   for each row execute function public.touch_items();
+-- 允许 App（登录用户）通过 API 读写这张表
+grant select, insert, update, delete on public.items to authenticated;
