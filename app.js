@@ -316,12 +316,16 @@ function homeView() {
   setBar("刷题卡片"); setTab("home");
   const decks = all("deck").sort((a, b) => (a.data.order ?? 0) - (b.data.order ?? 0) || a.updated_at - b.updated_at);
   view().innerHTML = (decks.length ? decks.map(d => {
-    const s = deckStats(d.id);
-    return `<a class="card deck" href="#/deck/${d.id}"><h3>${esc(d.data.name)}</h3>
-      <div class="stats"><span><b>${s.total}</b> 张</span><span class="due"><b>${s.due}</b> 待复习</span><span><b>${s.fresh}</b> 未学</span><span class="bad"><b>${s.book}</b> 错题</span></div></a>`;
+    const s = deckStats(d.id); const r = roundProgress(d.id);
+    const pct = r.total ? Math.round((r.done / r.total) * 100) : 0;
+    return `<div class="card deck" data-deck="${d.id}">
+      <div class="deck-head"><h3>${esc(d.data.name)}</h3><a class="more" href="#/deck/${d.id}" aria-label="管理">⋯</a></div>
+      <div class="deck-bar"><div style="width:${pct}%"></div></div>
+      <div class="stats"><span>${r.round > 1 ? `第 ${r.round} 轮 · ` : ""}进度 <b>${r.done}</b> / ${r.total}</span><span class="bad"><b>${s.book}</b> 错题</span></div></div>`;
   }).join("") : `<div class="empty">还没有 session，点下面新建一个</div>`) +
     `<button id="new-deck" style="width:100%">＋ 新建 session</button>`;
   $("#new-deck").onclick = () => { location.hash = "#/deck-edit/new"; };
+  view().querySelectorAll("[data-deck]").forEach(el => el.onclick = e => { if (e.target.closest(".more")) return; startDeck(el.dataset.deck); });
 }
 
 function deckEditView(id) {
@@ -353,14 +357,14 @@ function deckView(id) {
   const deck = get(id); if (!deck) { location.hash = "#/"; return; }
   setBar(deck.data.name, "#/"); setTab("home");
   const s = deckStats(id); const cards = cardsOf(id);
-  const canStudy = buildQueue(id, "learn").length;
+  const r = roundProgress(id);
   view().innerHTML = `
     <div class="card"><div class="stats" style="font-size:15px"><span><b>${s.total}</b> 张</span><span class="due"><b>${s.due}</b> 待复习</span><span><b>${s.fresh}</b> 未学</span><span class="bad"><b>${s.book}</b> 错题</span></div>
     <div class="muted" style="margin-top:4px">今天已学新题 ${s.newToday} / ${deck.data.newPerDay ?? 20}</div></div>
-    <button id="go" style="width:100%;font-size:18px" ${canStudy ? "" : "disabled"}>${canStudy ? `开始刷题（${canStudy} 题）` : "今天的任务完成了 🎉"}</button>
+    <button id="go" style="width:100%;font-size:18px" ${s.total ? "" : "disabled"}>${r.done ? `继续刷题（${r.done} / ${r.total}）` : "开始刷题"}</button>
     <div class="row" style="margin-top:8px">
       <button id="go-wrong" class="secondary" ${s.book ? "" : "disabled"}>练错题（${s.book}）</button>
-      <button id="go-rand" class="secondary" ${s.total ? "" : "disabled"}>随机练习</button>
+      <button id="go-reset" class="secondary" ${r.done ? "" : "disabled"}>从头再来一轮</button>
     </div>
     <div class="section-title">卡片</div>
     <div class="row"><a class="btn secondary" href="#/card/${id}/new">＋ 添加</a><a class="btn secondary" href="#/import/${id}">批量导入</a><a class="btn secondary" href="#/deck-edit/${id}">设置</a></div>
@@ -377,9 +381,9 @@ function deckView(id) {
   };
   renderList();
   $("#search")?.addEventListener("input", e => renderList(e.target.value.trim()));
-  $("#go").onclick = () => startStudy(id, "learn");
+  $("#go").onclick = () => startDeck(id);
   $("#go-wrong").onclick = () => startStudy(id, "wrong");
-  $("#go-rand").onclick = () => startStudy(id, "random");
+  $("#go-reset").onclick = () => { if (!confirm("清空本轮进度，重新打乱从头开始？（错题本不受影响）")) return; const old = sessOf(id); put("sess", "s_" + id, freshRound(id, (old?.round || 1) + 1)); startDeck(id); };
 }
 
 function cardEditView(deckId, cardId) {
@@ -472,67 +476,142 @@ function importView(deckId) {
 }
 
 // ---------- study ----------
-let S = null; // { deckId, mode, queue, idx, right, wrong, again:Set }
+// S = { id, deckId, mode, queue:[cardId], idx, ans:{pos:{pick,ok}}, round, back }
+let S = null;
+const uniq = a => [...new Set(a)];
+function sessOf(deckId) { return get("s_" + deckId)?.data || null; }
+function freshRound(deckId, round = 1) {
+  return { deckId, mode: "round", queue: shuffle(cardsOf(deckId).map(c => c.id)), idx: 0, ans: {}, round };
+}
+// 本轮进度：答过的题数 / 总题数
+function roundProgress(deckId) {
+  const total = cardsOf(deckId).length; const s = sessOf(deckId);
+  if (!s) return { done: 0, total };
+  const ids = new Set(Object.keys(s.ans).map(p => s.queue[p]).filter(id => get(id)));
+  return { done: Math.min(ids.size, total), total, round: s.round || 1 };
+}
+function saveS() { if (S?.id) { const { back, ...data } = S; put("sess", S.id, data); } }
+function startDeck(deckId) {
+  if (!cardsOf(deckId).length) { location.hash = `#/deck/${deckId}`; return toast("这个 session 还没有卡片，先添加或导入"); }
+  let s = sessOf(deckId);
+  if (!s) s = freshRound(deckId);
+  s = JSON.parse(JSON.stringify(s));
+  // 后来新加的卡片随机插进还没做的部分
+  const have = new Set(s.queue);
+  for (const c of cardsOf(deckId)) if (!have.has(c.id)) { const at = s.idx + Math.floor(Math.random() * (s.queue.length - s.idx + 1)); s.queue.splice(at, 0, c.id); shiftAns(s, at); }
+  S = { ...s, id: "s_" + deckId, back: "#/" };
+  saveS(); location.hash = "#/study";
+}
+function newRound() { S = { ...freshRound(S.deckId, (S.round || 1) + 1), id: S.id, back: S.back }; saveS(); studyView(); }
 function startStudy(deckId, mode) {
   const queue = buildQueue(deckId, mode);
   if (!queue.length) return toast("没有需要刷的题");
-  S = { deckId, mode, queue, idx: 0, right: 0, wrong: 0, total: queue.length, back: deckId ? `#/deck/${deckId}` : "#/wrong" };
+  S = { id: null, deckId, mode, queue, idx: 0, ans: {}, round: 1, back: deckId ? `#/deck/${deckId}` : "#/wrong" };
   location.hash = "#/study";
+}
+function shiftAns(s, at) {
+  const n = {}; for (const [k, v] of Object.entries(s.ans)) n[+k >= at ? +k + 1 : k] = v; s.ans = n;
+}
+function go(step) {
+  const to = S.idx + step;
+  if (to < 0) return toast("已经是第一题");
+  if (to > S.queue.length) return;
+  S.idx = to; saveS();
+  const v = view(); v.classList.remove("slide-l", "slide-r"); void v.offsetWidth; v.classList.add(step > 0 ? "slide-l" : "slide-r");
+  window.scrollTo(0, 0); studyView();
 }
 function studyView() {
   if (!S) { location.hash = "#/"; return; }
   document.body.classList.add("studying");
-  setBar(S.mode === "wrong" ? "错题练习" : S.mode === "random" ? "随机练习" : (get(S.deckId)?.data.name || "刷题"), S.back);
+  const deckName = get(S.deckId)?.data.name || "刷题";
+  setBar(S.mode === "wrong" ? "错题练习" : S.mode === "random" ? "随机练习" : deckName, S.back);
   if (S.idx >= S.queue.length) return studyDone();
-  const card = get(S.queue[S.idx]); if (!card) { S.idx++; return studyView(); }
+  const card = get(S.queue[S.idx]);
+  if (!card) { S.queue.splice(S.idx, 1); const n = {}; for (const [k, v] of Object.entries(S.ans)) { if (+k < S.idx) n[k] = v; else if (+k > S.idx) n[+k - 1] = v; } S.ans = n; saveS(); return studyView(); }
   const d = card.data; const p = progOf(card.id);
-  const pct = Math.min(100, Math.round((S.idx / S.queue.length) * 100));
+  const pos = S.idx; const rec = S.ans[pos];
+  const answeredIds = new Set(Object.keys(S.ans).map(k => S.queue[k]));
+  const totalU = uniq(S.queue).length;
+  const pct = Math.min(100, Math.round((answeredIds.size / totalU) * 100));
+  const vals = Object.values(S.ans); const nR = vals.filter(x => x.ok).length, nW = vals.length - nR;
   const head = `<div class="progress"><div style="width:${pct}%"></div></div>
-    <div class="q-meta"><span>${S.idx + 1} / ${S.queue.length}</span><span>${p?.inBook ? '<span class="tag bad">错题本</span> ' : ""}${!p ? '<span class="tag">新</span>' : ""} ✓${S.right} ✗${S.wrong}</span></div>`;
-  let answered = false, pick = null;
+    <div class="q-meta"><span>${pos + 1} / ${S.queue.length}</span><span>${p?.inBook ? '<span class="tag bad">错题本</span> ' : ""}✓${nR} ✗${nW}</span></div>`;
   const order = d.type === "choice" ? (settings.shuffleOptions ? shuffle(d.options.map((_, i) => i)) : d.options.map((_, i) => i)) : [];
+  const navRow = `<div class="row"><button class="ghost" id="prev" ${pos === 0 ? "disabled" : ""}>← 上一题</button><button id="next">${S.idx === S.queue.length - 1 ? "完成" : "下一题 →"}</button></div>`;
 
+  const answer = ok => {
+    grade(card, ok);
+    S.ans[pos] = { pick: rec?.pick ?? null, ok, ...S.ans[pos] };
+    if (!ok) { // 本轮内过几题再出一次
+      // 同一轮里每题最多重复出现一次
+      if (S.queue.filter(id => id === card.id).length < 2) { const at = Math.min(S.queue.length, pos + 4); S.queue.splice(at, 0, card.id); shiftAns(S, at); }
+    }
+    saveS();
+    const v = Object.values(S.ans); const r = v.filter(x => x.ok).length;
+    const m = $(".q-meta"); if (m) m.innerHTML = `<span>${pos + 1} / ${S.queue.length}</span><span>${!ok || p?.inBook ? '<span class="tag bad">错题本</span> ' : ""}✓${r} ✗${v.length - r}</span>`;
+    const bar = $(".progress div"); if (bar) bar.style.width = Math.min(100, Math.round(new Set(Object.keys(S.ans).map(k => S.queue[k])).size / uniq(S.queue).length * 100)) + "%";
+  };
+  const showChoiceResult = (pick, fresh) => {
+    const ok = pick === d.answer;
+    view().querySelectorAll(".opt").forEach(x => { const i = +x.dataset.i; x.disabled = true; if (i === d.answer) x.classList.add("right"); else if (i === pick) x.classList.add("wrong"); });
+    $("#after").innerHTML = `<div class="verdict ${ok ? "ok" : "bad"}">${ok ? "✓ 正确" : "✗ 错了，已加入错题本"}</div>${d.note ? `<div class="note">${esc(d.note)}</div>` : ""}<div class="ai" id="ai"></div>`;
+    $("#actions").innerHTML = `<div class="row"><button id="ai-btn" class="secondary">查看解析</button></div>${navRow}`;
+    $("#ai-btn").onclick = () => runAI(card, pick);
+    bindNav();
+    if (fresh) setTimeout(() => $("#after").scrollIntoView({ behavior: "smooth", block: "center" }), 50);
+  };
   const renderChoice = () => {
     view().innerHTML = `${head}<div class="card"><div class="q-text">${richQ(d.q)}</div>
       <div class="opts">${order.map((oi, k) => `<button class="opt" data-i="${oi}"><span class="n">${k + 1}</span><span>${esc(d.options[oi])}</span></button>`).join("")}</div>
-      <div id="after"></div></div><div class="study-actions" id="actions"></div>`;
+      <div id="after"></div></div><div class="study-actions" id="actions">${navRow.replace("下一题 →", "跳过 →")}</div>`;
+    bindNav();
+    if (rec) return showChoiceResult(rec.pick, false);
     view().querySelectorAll(".opt").forEach(b => b.onclick = () => {
-      if (answered) return; answered = true; pick = +b.dataset.i;
-      const ok = pick === d.answer;
-      view().querySelectorAll(".opt").forEach(x => { const i = +x.dataset.i; if (i === d.answer) x.classList.add("right"); else if (i === pick) x.classList.add("wrong"); });
-      record(card, ok);
-      $("#after").innerHTML = `<div class="verdict ${ok ? "ok" : "bad"}">${ok ? "✓ 正确" : "✗ 错了，已加入错题本"}</div>${d.note ? `<div class="note">${esc(d.note)}</div>` : ""}<div class="ai" id="ai"></div>`;
-      showActions(ok);
-      setTimeout(() => $("#after").scrollIntoView({ behavior: "smooth", block: "center" }), 50);
+      if (S.ans[pos]) return;
+      const pick = +b.dataset.i; S.ans[pos] = { pick };
+      answer(pick === d.answer); showChoiceResult(pick, true);
     });
   };
+  const flipped = () => {
+    $("#after").innerHTML = `<div class="flash-back">${esc(d.a || "")}</div>${d.note ? `<div class="note">${esc(d.note)}</div>` : ""}<div class="ai" id="ai"></div>`;
+    const r = S.ans[pos];
+    $("#actions").innerHTML = (r ? `<div class="verdict ${r.ok ? "ok" : "bad"}" style="text-align:center;margin:0 0 4px">${r.ok ? "✓ 记得" : "✗ 不记得（已加入错题本）"}</div>`
+      : `<div class="row"><button id="forgot" class="danger">✗ 不记得</button><button id="knew" style="background:var(--ok)">✓ 记得</button></div>`) +
+      `<div class="row"><button id="ai-btn" class="secondary">查看解析</button></div>${r ? navRow : ""}`;
+    $("#ai-btn").onclick = () => runAI(card, null);
+    if (r) bindNav();
+    else {
+      $("#forgot").onclick = () => { answer(false); go(1); };
+      $("#knew").onclick = () => { answer(true); go(1); };
+    }
+  };
   const renderFlash = () => {
-    view().innerHTML = `${head}<div class="card"><div class="flash-front">${richQ(d.q)}</div><div id="after"></div></div><div class="study-actions" id="actions"><button id="flip" style="width:100%">显示答案</button></div>`;
-    $("#flip").onclick = () => {
-      $("#after").innerHTML = `<div class="flash-back">${esc(d.a || "")}</div>${d.note ? `<div class="note">${esc(d.note)}</div>` : ""}<div class="ai" id="ai"></div>`;
-      $("#actions").innerHTML = `<div class="row"><button id="forgot" class="danger">✗ 不记得</button><button id="knew" style="background:var(--ok)">✓ 记得</button></div><div class="row"><button id="ai-btn" class="secondary">查看解析</button></div>`;
-      $("#ai-btn").onclick = () => runAI(card, null);
-      $("#forgot").onclick = () => { record(card, false); next(); };
-      $("#knew").onclick = () => { record(card, true); next(); };
-    };
+    view().innerHTML = `${head}<div class="card"><div class="flash-front">${richQ(d.q)}</div><div id="after"></div></div><div class="study-actions" id="actions"><button id="flip" style="width:100%">显示答案</button>${navRow.replace("下一题 →", "跳过 →")}</div>`;
+    bindNav();
+    if (rec) return flipped();
+    $("#flip").onclick = flipped;
   };
-  const showActions = () => {
-    $("#actions").innerHTML = `<div class="row"><button id="ai-btn" class="secondary">查看解析</button><button id="next">下一题 →</button></div>`;
-    $("#ai-btn").onclick = () => runAI(card, pick);
-    $("#next").onclick = next;
-  };
-  const next = () => { S.idx++; window.scrollTo(0, 0); studyView(); };
   if (d.type === "choice") renderChoice(); else renderFlash();
 }
-function record(card, ok) {
-  grade(card, ok);
-  if (ok) S.right++; else {
-    S.wrong++;
-    // 本轮内过几题再出一次
-    const pos = Math.min(S.queue.length, S.idx + 4);
-    if (S.queue.indexOf(card.id, S.idx + 1) < 0) S.queue.splice(pos, 0, card.id);
-  }
+function bindNav() {
+  const p = $("#prev"), n = $("#next");
+  if (p) p.onclick = () => go(-1);
+  if (n) n.onclick = () => go(1);
 }
+// 左滑下一题，右滑上一题
+(function swipe() {
+  let x0 = null, y0 = 0, t0 = 0;
+  document.addEventListener("touchstart", e => {
+    if (!document.body.classList.contains("studying") || e.touches.length !== 1) { x0 = null; return; }
+    x0 = e.touches[0].clientX; y0 = e.touches[0].clientY; t0 = Date.now();
+  }, { passive: true });
+  document.addEventListener("touchend", e => {
+    if (x0 == null || !S) return;
+    const t = e.changedTouches[0]; const dx = t.clientX - x0, dy = t.clientY - y0; x0 = null;
+    if (Math.abs(dx) < 60 || Math.abs(dy) > Math.abs(dx) * 0.7 || Date.now() - t0 > 800) return;
+    if (dx < 0) { if (S.idx < S.queue.length) go(1); } else go(-1);
+  }, { passive: true });
+})();
 async function runAI(card, pick) {
   const box = $("#ai"); const btn = $("#ai-btn");
   const cached = get(card.id)?.data.ai;
@@ -559,14 +638,18 @@ async function runAI(card, pick) {
   }
 }
 function studyDone() {
-  const total = S.right + S.wrong; const rate = total ? Math.round((S.right / total) * 100) : 0;
-  view().innerHTML = `<div class="done-big">🎉</div><h2 style="text-align:center;margin:8px 0">这一轮完成了</h2>
-    <div class="card" style="text-align:center"><div class="stats" style="justify-content:center;font-size:16px"><span>答对 <b>${S.right}</b></span><span class="bad">答错 <b>${S.wrong}</b></span><span>正确率 <b>${rate}%</b></span></div></div>
-    <button id="done" style="width:100%">返回</button>`;
+  const vals = Object.values(S.ans); const right = vals.filter(x => x.ok).length, wrong = vals.length - right;
+  const rate = vals.length ? Math.round((right / vals.length) * 100) : 0;
+  const skipped = S.queue.length - vals.length;
+  view().innerHTML = `<div class="done-big">🎉</div><h2 style="text-align:center;margin:8px 0">${S.mode === "round" ? `第 ${S.round || 1} 轮完成了` : "这一轮完成了"}</h2>
+    <div class="card" style="text-align:center"><div class="stats" style="justify-content:center;font-size:16px"><span>答对 <b>${right}</b></span><span class="bad">答错 <b>${wrong}</b></span><span>正确率 <b>${rate}%</b></span>${skipped > 0 ? `<span>跳过 <b>${skipped}</b></span>` : ""}</div></div>
+    ${S.mode === "round" ? `<button id="again" style="width:100%">再来一轮（重新打乱）</button><div style="height:8px"></div>` : ""}
+    <div class="row"><button id="back-last" class="ghost">← 回到上一题</button><button id="done" class="secondary">返回</button></div>`;
+  $("#again")?.addEventListener("click", newRound);
+  $("#back-last").onclick = () => go(-1);
   $("#done").onclick = () => { location.hash = S.back; };
   syncNow();
 }
-
 function wrongView() {
   setBar("错题本"); setTab("wrong");
   const book = all("prog").filter(p => p.data.inBook && get(p.data.cardId));

@@ -108,3 +108,15 @@ textarea { min-height: 140px; font-size: 14px; font-family: ui-monospace, Menlo,
 @keyframes spin { to { transform: rotate(360deg); } }
 details summary { cursor: pointer; color: var(--accent); }
 pre.fmt { white-space: pre-wrap; font-size: 12px; background: var(--bg); padding: 10px; border-radius: 8px; overflow-x: auto; }
+.deck { cursor: pointer; }
+.deck:active { transform: scale(.985); }
+.deck-head { display: flex; align-items: center; gap: 8px; }
+.deck-head h3 { flex: 1; margin: 0; }
+.deck .more { color: var(--muted); text-decoration: none; font-size: 22px; line-height: 1; padding: 2px 4px 8px 14px; }
+.deck-bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin: 10px 0 8px; }
+.deck-bar div { height: 100%; background: var(--accent); border-radius: 4px; transition: width .3s; }
+.slide-l { animation: slideL .22s ease-out; }
+.slide-r { animation: slideR .22s ease-out; }
+@keyframes slideL { from { transform: translateX(36px); opacity: .3; } to { transform: none; opacity: 1; } }
+@keyframes slideR { from { transform: translateX(-36px); opacity: .3; } to { transform: none; opacity: 1; } }
+.opt:disabled { opacity: 1; }
