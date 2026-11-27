@@ -17,6 +17,16 @@ function toast(msg, ms = 2200) {
 function shuffle(a) { a = a.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
 // ＿词＿ 或 <u>词</u> 显示为下划线
 function richQ(s) { return esc(s).replace(/＿([^＿\n]+)＿/g, '<span class="ul">$1</span>').replace(/&lt;u&gt;(.*?)&lt;\/u&gt;/g, '<span class="ul">$1</span>'); }
+// 把题目拆成「题干（作答要求）」和「正文」：第一段是短的说明就当作题干
+function splitQ(q) {
+  q = String(q || "");
+  const parts = q.split(/\n\s*\n/);
+  if (parts.length > 1 && parts[0].trim().length <= 80) return { stem: parts[0].trim(), body: parts.slice(1).join("\n\n").trim() };
+  const lines = q.split("\n");
+  if (lines.length > 1 && /(なさい|選べ|选择|选出|choose|select)[。.:：]?\s*$/i.test(lines[0].trim())) return { stem: lines[0].trim(), body: lines.slice(1).join("\n").trim() };
+  return { stem: "", body: q };
+}
+const qBody = q => splitQ(q).body;
 function md(s) {
   const lines = esc(s).split("\n"); let out = "", inList = false;
   const inline = t => t.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/`([^`]+)`/g, "<code>$1</code>");
@@ -326,7 +336,9 @@ function answerIndex(ans, options) {
   return options.findIndex(o => o === s);
 }
 function normalizeCard(o) {
-  const q = o.q ?? o.question ?? o.front ?? o.word ?? o["题目"] ?? o["问题"] ?? o["正面"];
+  let q = o.q ?? o.question ?? o.front ?? o.word ?? o["题目"] ?? o["问题"] ?? o["正面"];
+  const stem = o.stem ?? o.instruction ?? o["题干"];
+  if (q && stem) q = `${stem}\n\n${q}`;
   const note = o.note ?? o.explanation ?? o["解析"] ?? o["备注"] ?? "";
   const options = o.options ?? o.choices ?? o["选项"];
   if (!q) return null;
@@ -447,7 +459,7 @@ function deckView(id) {
     const shown = cards.filter(c => !f || (c.data.q + (c.data.a || "") + (c.data.options || []).join("")).includes(f));
     $("#clist").innerHTML = shown.slice(0, 300).map(c => {
       const p = progOf(c.id);
-      return `<a class="list-item" href="#/card/${id}/${c.id}" style="color:inherit;text-decoration:none"><span class="grow">${esc(c.data.q.replace(/\s+/g, " "))}</span>${p?.inBook ? '<span class="tag bad">错题</span>' : ""}<span class="tag">${c.data.type === "choice" ? "选择" : "卡片"}</span></a>`;
+      return `<a class="list-item" href="#/card/${id}/${c.id}" style="color:inherit;text-decoration:none"><span class="grow">${esc(qBody(c.data.q).replace(/\s+/g, " "))}</span>${p?.inBook ? '<span class="tag bad">错题</span>' : ""}<span class="tag">${c.data.type === "choice" ? "选择" : "卡片"}</span></a>`;
     }).join("") + (shown.length > 300 ? `<div class="muted">只显示前 300 张，请用搜索</div>` : "");
   };
   renderList();
@@ -465,7 +477,7 @@ function cardEditView(deckId, cardId) {
   const render = () => {
     view().innerHTML = `<div class="card">
       <div class="row"><button class="small ${type === "choice" ? "" : "ghost"}" data-t="choice">选择题</button><button class="small ${type === "flash" ? "" : "ghost"}" data-t="flash">单词卡（正反面）</button></div>
-      <label>${type === "choice" ? "题目（用 ＿词＿ 表示下划线）" : "正面（单词）"}</label><textarea id="f-q" style="min-height:90px;font-family:inherit;font-size:16px">${esc(d.q)}</textarea>
+      <label>${type === "choice" ? "题目（第一段写作答要求、空一行再写题目，会显示成小字；用 ＿词＿ 表示下划线）" : "正面（单词）"}</label><textarea id="f-q" style="min-height:90px;font-family:inherit;font-size:16px">${esc(d.q)}</textarea>
       ${type === "choice" ? `<label>选项（点圆圈选正确答案）</label>${(d.options || ["", "", "", ""]).map((o, i) => `
         <div class="row" style="align-items:center;margin-bottom:6px"><input type="radio" name="ans" value="${i}" ${d.answer === i ? "checked" : ""} style="flex:0 0 22px;width:22px;height:22px">
         <input class="f-opt" value="${esc(o)}" placeholder="选项 ${i + 1}" style="flex:1"></div>`).join("")}
@@ -507,7 +519,7 @@ function cardEditView(deckId, cardId) {
 }
 
 const AI_PROMPT = `请把下面的题目整理成 JSON 数组，每道选择题格式：
-{"q": "题目（下划线部分用＿词＿标出）", "options": ["选项1","选项2","选项3","选项4"], "answer": 正确选项的序号(1-4), "note": "解析(可选)"}
+{"stem": "作答要求（如：（　）に入れるのに最もよいものを選びなさい。）", "q": "题目正文（下划线部分用＿词＿标出）", "options": ["选项1","选项2","选项3","选项4"], "answer": 正确选项的序号(1-4), "note": "解析(可选)"}
 每个单词卡格式：{"q": "单词", "a": "读音 + 意思"}
 只输出 JSON，不要其他文字。`;
 
@@ -632,7 +644,8 @@ function studyView() {
     if (fresh) setTimeout(() => $("#after").scrollIntoView({ behavior: "smooth", block: "center" }), 50);
   };
   const renderChoice = () => {
-    view().innerHTML = `${head}<div class="card"><div class="q-text">${richQ(d.q)}</div>
+    const sq = splitQ(d.q);
+    view().innerHTML = `${head}<div class="card">${sq.stem ? `<div class="q-stem">${richQ(sq.stem)}</div>` : ""}<div class="q-text">${richQ(sq.body)}</div>
       <div class="opts">${order.map((oi, k) => `<button class="opt" data-i="${oi}"><span class="n">${k + 1}</span><span>${esc(d.options[oi])}</span></button>`).join("")}</div>
       <div id="after"></div></div><div class="study-actions" id="actions">${navRow.replace("下一题 →", "跳过 →")}</div>`;
     bindNav();
@@ -766,7 +779,7 @@ function wrongView() {
     <div class="muted" style="margin:8px 4px">答错的题会自动放进来，之后连续答对 2 次会自动移出。</div>` +
     Object.entries(byDeck).map(([did, ps]) => `<div class="section-title">${esc(get(did)?.data.name || "已删除")}</div><div class="card">
       <button class="small secondary" data-deck="${did}" style="width:100%;margin-bottom:6px">只练这个（${ps.length}）</button>
-      ${ps.sort((a, b) => b.data.wrong - a.data.wrong).map(p => { const c = get(p.data.cardId); return `<div class="list-item"><a class="grow" href="#/card/${did}/${c.id}" style="color:inherit;text-decoration:none">${esc(c.data.q.replace(/\s+/g, " "))}</a><span class="tag bad">错${p.data.wrong}次</span><button class="small ghost" data-out="${p.id}">移出</button></div>`; }).join("")}</div>`).join("")
+      ${ps.sort((a, b) => b.data.wrong - a.data.wrong).map(p => { const c = get(p.data.cardId); return `<div class="list-item"><a class="grow" href="#/card/${did}/${c.id}" style="color:inherit;text-decoration:none">${esc(qBody(c.data.q).replace(/\s+/g, " "))}</a><span class="tag bad">错${p.data.wrong}次</span><button class="small ghost" data-out="${p.id}">移出</button></div>`; }).join("")}</div>`).join("")
     : `<div class="empty">📕<br>错题本是空的<br>刷题时答错的题会自动放进来</div>`;
   $("#all")?.addEventListener("click", () => startStudy(null, "wrong"));
   view().querySelectorAll("[data-deck]").forEach(b => b.onclick = () => startStudy(b.dataset.deck, "wrong"));
