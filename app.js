@@ -320,6 +320,7 @@ async function explain(card, userPick, onText) {
   return { ...res, q, chat: [] };
 }
 async function explainClaude(system, messages, onText) {
+  const account = sbUser ? { client: sb, userId: sbUser.id } : null;
   if (!AnthropicCtor) AnthropicCtor = (await import(ANTHROPIC_ESM)).default;
   const client = new AnthropicCtor({ apiKey: aiKey(), dangerouslyAllowBrowser: true });
   const model = aiModel() || "claude-opus-5-5";
@@ -335,6 +336,12 @@ async function explainClaude(system, messages, onText) {
   });
   stream.on("text", t => onText(t));
   const msg = await stream.finalMessage();
+  const usage = msg.usage;
+  const cacheRead = usage?.cache_read_input_tokens;
+  const cacheWrite = usage?.cache_creation_input_tokens;
+  void saveCloudUsage(account, "claude", msg.model || model,
+    usage?.input_tokens == null ? null : usage.input_tokens + (cacheRead ?? 0) + (cacheWrite ?? 0),
+    usage?.output_tokens, cacheRead, cacheWrite);
   if (msg.stop_reason === "refusal") throw new Error("AI 拒绝回答这道题");
   const text = msg.content.filter(b => b.type === "text").map(b => b.text).join("");
   return { text, model: msg.model, at: Date.now() };
@@ -344,13 +351,15 @@ async function explainOpenAICompat(prov, system, messages, onText) {
   const base = (prov === "custom" ? settings.customBase : PROVIDERS[prov].base || "").replace(/\/+$/, "");
   if (!base) throw new Error("请在设置里填写接口地址（Base URL）");
   const model = aiModel(); if (!model) throw new Error("请在设置里填写模型名称");
+  const account = sbUser ? { client: sb, userId: sbUser.id } : null;
+  const deepSeek = prov === "deepseek" ? deepSeekModel(model) : null;
+  let actualModel = deepSeek?.model ?? model;
   let res;
   try {
-    const deepSeek = prov === "deepseek" ? deepSeekModel(model) : null;
     res = await fetch(base + "/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + aiKey() },
-      body: JSON.stringify({ model, stream: true, ...(deepSeek ? { stream_options: { include_usage: true }, ...deepSeek } : {}), max_tokens: 4000, messages: [{ role: "system", content: system }, ...messages] }),
+      body: JSON.stringify({ model, stream: true, ...(prov !== "custom" ? { stream_options: { include_usage: true } } : {}), ...deepSeek, max_tokens: 4000, messages: [{ role: "system", content: system }, ...messages] }),
     });
   } catch (e) { throw new Error("连不上接口（网络问题，或这个服务不允许网页直接调用）"); }
   if (!res.ok) {
@@ -359,16 +368,19 @@ async function explainOpenAICompat(prov, system, messages, onText) {
   }
   const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = "", text = "", usage;
   for (;;) {
-    const { value, done } = await reader.read(); if (done) break;
-    buf += dec.decode(value, { stream: true });
+    const { value, done } = await reader.read();
+    buf += done ? dec.decode() + "\n" : dec.decode(value, { stream: true });
     let i;
     while ((i = buf.indexOf("\n")) >= 0) {
       const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
       if (!line.startsWith("data:")) continue;
       const data = line.slice(5).trim(); if (data === "[DONE]") continue;
-      try { const chunk = JSON.parse(data); usage = chunk.usage || usage; const t = chunk.choices?.[0]?.delta?.content; if (t) { text += t; onText(t); } } catch {}
+      try { const chunk = JSON.parse(data); usage = chunk.usage || usage; actualModel = chunk.model || actualModel; const t = chunk.choices?.[0]?.delta?.content; if (t) { text += t; onText(t); } } catch {}
     }
+    if (done) break;
   }
+  void saveCloudUsage(account, prov, actualModel, usage?.prompt_tokens, usage?.completion_tokens,
+    usage?.prompt_cache_hit_tokens ?? usage?.prompt_tokens_details?.cached_tokens);
   if (!text) throw new Error("接口没有返回内容");
   recordUsage(prov, base, model, usage);
   return { text, model, at: Date.now() };
@@ -975,6 +987,25 @@ function renderPromptSettings() {
 }
 function usageKey(provider, base, model) {
   return JSON.stringify([provider, base.replace(/\/+$/, ""), model]);
+}
+
+async function saveCloudUsage(account, provider, model, input, output, cacheRead, cacheWrite) {
+  if (!account?.client || !Number.isSafeInteger(input) || !Number.isSafeInteger(output)
+      || input < 0 || output < 0 || input + output === 0) return;
+  try {
+    const { error } = await account.client.from("ai_token_usage").insert({
+      user_id: account.userId,
+      provider,
+      model,
+      input_tokens: input,
+      output_tokens: output,
+      cache_read_input_tokens: cacheRead ?? null,
+      cache_write_input_tokens: cacheWrite ?? null,
+    });
+    if (error) console.warn("Token usage insert failed", error.code);
+  } catch {
+    console.warn("Token usage insert failed");
+  }
 }
 
 function recordUsage(provider, base, model, usage) {
