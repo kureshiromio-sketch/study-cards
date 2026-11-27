@@ -104,16 +104,21 @@ const cardsOf = deckId => all("card").filter(c => c.data.deckId === deckId).sort
 const progOf = cardId => get("p_" + cardId)?.data;
 
 // ---------- cloud sync (Supabase) ----------
-let sb = null, sbUser = null, syncing = false, syncTimer = null;
+let sb = null, sbUser = null, syncing = false, syncTimer = null, pwRecovery = false;
 const setDot = s => { const d = $("#sync-dot"); d.className = s || ""; };
 async function initSupabase() {
   if (!sbUrl() || !sbKey()) { sb = null; sbUser = null; setDot(""); return; }
   try {
+    const h = location.hash;
+    if (/type=recovery/.test(h)) pwRecovery = true;
+    const urlErr = /error_description=([^&]+)/.exec(h);
     const { createClient } = await import(SUPABASE_ESM);
     sb = createClient(sbUrl(), sbKey(), { auth: { persistSession: true, autoRefreshToken: true } });
     const { data } = await sb.auth.getSession();
     sbUser = data.session?.user || null;
-    sb.auth.onAuthStateChange((_e, session) => { sbUser = session?.user || null; });
+    sb.auth.onAuthStateChange((e, session) => { sbUser = session?.user || null; if (e === "PASSWORD_RECOVERY") pwRecovery = true; });
+    if (/access_token=|error_description=/.test(location.hash)) history.replaceState(null, "", location.pathname + (pwRecovery ? "#/settings" : "#/"));
+    if (urlErr) setTimeout(() => toast("链接无效或已过期，请重新点「忘记密码」：" + decodeURIComponent(urlErr[1].replace(/\+/g, " ")), 6000), 500);
   } catch (e) { console.error(e); sb = null; setDot("err"); }
 }
 function scheduleSync(delay = 4000) { if (!sb || !sbUser) return; clearTimeout(syncTimer); syncTimer = setTimeout(() => syncNow(), delay); }
@@ -780,11 +785,18 @@ function settingsView() {
     <div class="section-title">云同步</div>
     <div class="card" id="cloud">
       ${!cloudReady ? `<div class="muted">还没有配置云同步，现在数据只保存在这台设备上。</div>`
-      : sbUser ? `<div>已登录：<b>${esc(sbUser.email)}</b></div><div class="row" style="margin-top:10px"><button id="sync">立即同步</button><button id="logout" class="ghost">退出登录</button></div>`
+      : sbUser ? `<div>已登录：<b>${esc(sbUser.email)}</b></div>
+        ${pwRecovery ? `<div style="margin-top:10px;font-weight:600">请设置新密码</div>` : ""}
+        <details style="margin-top:10px" ${pwRecovery ? "open" : ""}><summary>修改密码</summary>
+          <label>新密码（至少 6 位）</label><input id="npw" type="password" autocomplete="new-password">
+          <button id="setpw" class="small" style="margin-top:8px">保存新密码</button>
+        </details>
+        <div class="row" style="margin-top:10px"><button id="sync">立即同步</button><button id="logout" class="ghost">退出登录</button></div>`
       : `<div class="muted">登录后，手机和电脑上的题库、进度、错题本会自动同步。</div>
         <label>邮箱</label><input id="em" type="email" autocomplete="username">
         <label>密码（至少 6 位）</label><input id="pw" type="password" autocomplete="current-password">
-        <div class="row" style="margin-top:10px"><button id="login">登录</button><button id="signup" class="secondary">注册新账号</button></div>`}
+        <div class="row" style="margin-top:10px"><button id="login">登录</button><button id="signup" class="secondary">注册新账号</button></div>
+        <button id="forgot" class="small ghost" style="margin-top:8px">忘记密码？</button>`}
       <details style="margin-top:12px"><summary>高级：Supabase 连接信息</summary>
         <label>Project URL</label><input id="sb-url" value="${esc(settings.supabaseUrl)}" placeholder="${esc(window.APP_CONFIG?.SUPABASE_URL || "https://xxxx.supabase.co")}">
         <label>anon / publishable key</label><input id="sb-key" value="${esc(settings.supabaseKey)}" placeholder="${window.APP_CONFIG?.SUPABASE_ANON_KEY ? "（已内置）" : ""}">
@@ -815,6 +827,20 @@ function settingsView() {
   $("#login")?.addEventListener("click", () => auth("login"));
   $("#signup")?.addEventListener("click", () => auth("signup"));
   $("#sync")?.addEventListener("click", () => syncNow(true));
+  $("#forgot")?.addEventListener("click", async () => {
+    const email = $("#em").value.trim();
+    if (!email) return toast("请先在上面填写邮箱");
+    const { error } = await sb.auth.resetPasswordForEmail(email, { redirectTo: location.origin + location.pathname });
+    if (error) return toast("发送失败：" + error.message, 5000);
+    toast("已发送重设密码邮件。请打开邮件里的链接（最好在这台设备上打开），然后设置新密码", 7000);
+  });
+  $("#setpw")?.addEventListener("click", async () => {
+    const password = $("#npw").value;
+    if (password.length < 6) return toast("新密码至少 6 位");
+    const { error } = await sb.auth.updateUser({ password });
+    if (error) return toast("修改失败：" + error.message, 5000);
+    pwRecovery = false; toast("新密码已保存，请记好"); settingsView();
+  });
   $("#logout")?.addEventListener("click", async () => { await sb.auth.signOut(); sbUser = null; setDot(""); settingsView(); });
   $("#export").onclick = () => {
     const blob = new Blob([JSON.stringify([...items.values()].filter(live), null, 1)], { type: "application/json" });
